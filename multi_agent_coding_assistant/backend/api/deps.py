@@ -1,15 +1,19 @@
 """FastAPI dependency injection scaffolding.
 
-This module centralizes dependencies for the API layer.
-
-At this stage we only provide placeholders so future implementations can
-cleanly plug into FastAPI's Depends() mechanism.
+At this stage we provide minimal DI wiring for the Coder capability.
+Dependencies remain loosely coupled so future agents can reuse the same
+infrastructure pieces.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
+
+from agents.coder_agent import CoderAgent
+from backend.application.use_cases import GenerateCodeUseCase
+from backend.infrastructure.llm_client import LLMClient
 
 
 def placeholder_dependency() -> Any:
@@ -28,4 +32,18 @@ def build_dependency_provider(factory: Callable[[], Any]) -> Callable[[], Any]:
         return factory()
 
     return _provider
+
+
+@lru_cache(maxsize=1)
+def _get_llm_client() -> LLMClient:
+    return LLMClient()
+
+
+def get_coder_agent() -> CoderAgent:
+    return CoderAgent(llm_client=_get_llm_client())
+
+
+@lru_cache(maxsize=1)
+def get_generate_code_use_case() -> GenerateCodeUseCase:
+    return GenerateCodeUseCase(coder_agent=get_coder_agent())
 
