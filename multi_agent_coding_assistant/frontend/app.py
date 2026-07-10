@@ -10,7 +10,7 @@ import re
 import requests
 import streamlit as st
 
-BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8000")
+BACKEND_URL = "http://localhost:8000"
 
 st.set_page_config(page_title="Multi-Agent Coding Assistant", layout="wide")
 st.title("Multi-Agent Coding Assistant")
@@ -105,5 +105,37 @@ if st.session_state.generated_code:
     # Clipboard copy in Streamlit is not reliably supported without using
     # custom components. Provide an always-available copy target instead.
     st.caption("Tip: select the code block and copy (Ctrl+C / Cmd+C).")
+
+    if st.button("Execute Code"):
+        try:
+            with st.spinner("Executing code..."):
+                resp = requests.post(
+                    f"{BACKEND_URL}/execute-code",
+                    json={"generated_code": st.session_state.generated_code},
+                    timeout=30,
+                )
+
+            if resp.status_code != 200:
+                st.error(f"Execution failed: {resp.status_code} - {resp.text}")
+            else:
+                data = resp.json()
+                st.subheader("Execution Output")
+
+                st.write(f"Exit Code: {data.get('exit_code', '')}")
+                st.write(f"Execution Time (ms): {data.get('execution_time_ms', '')}")
+
+                stdout = data.get("stdout", "")
+                stderr = data.get("stderr", "")
+
+                if stdout:
+                    st.code(stdout, language="text")
+
+                if stderr:
+                    st.subheader("Errors")
+                    st.code(stderr, language="text")
+                else:
+                    st.caption("No errors.")
+        except Exception as exc:  # pragma: no cover
+            st.error(f"Execution error: {exc}")
 
 
