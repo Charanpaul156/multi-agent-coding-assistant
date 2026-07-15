@@ -13,6 +13,9 @@ from typing import Any
 
 from agents.coder_agent import CoderAgent
 from backend.application.use_cases import GenerateCodeUseCase
+from backend.application.planning_use_cases import GeneratePlanUseCase
+from agents.planner_agent import PlannerAgent
+
 from backend.infrastructure.llm_client import LLMClient
 from backend.tools.python_executor import ExecuteCodeUseCase, PythonExecutor
 
@@ -47,6 +50,17 @@ def get_coder_agent() -> CoderAgent:
 @lru_cache(maxsize=1)
 def get_generate_code_use_case() -> GenerateCodeUseCase:
     return GenerateCodeUseCase(coder_agent=get_coder_agent())
+
+
+@lru_cache(maxsize=1)
+def get_planner_agent() -> PlannerAgent:
+    return PlannerAgent(llm_client=_get_llm_client())
+
+
+@lru_cache(maxsize=1)
+def get_generate_plan_use_case() -> GeneratePlanUseCase:
+    return GeneratePlanUseCase(planner_agent=get_planner_agent())
+
 
 
 @lru_cache(maxsize=1)

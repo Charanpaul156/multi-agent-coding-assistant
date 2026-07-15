@@ -55,12 +55,87 @@ with st.sidebar:
         except Exception as exc:  # pragma: no cover
             st.error(f"Health check error: {exc}")
 
+st.subheader("Planning")
+plan_prompt = st.text_area(
+    "Planning request",
+    height=120,
+    placeholder="Build a Banking Management System",
+)
+
+if "plan" not in st.session_state:
+    st.session_state.plan = None
+
+if st.button("Generate Plan"):
+    if not plan_prompt.strip():
+        st.error("Prompt must not be empty")
+    else:
+        try:
+            with st.spinner("Generating implementation plan..."):
+                resp = requests.post(
+                    f"{BACKEND_URL}/generate-plan",
+                    json={"prompt": plan_prompt},
+                    timeout=120,
+                )
+
+            if resp.status_code != 200:
+                st.error(f"Request failed: {resp.status_code} - {resp.text}")
+            else:
+                data = resp.json()
+                st.session_state.plan = data.get("plan", None)
+                st.success("Plan generated")
+        except Exception as exc:  # pragma: no cover
+            st.error(f"Failed to generate plan: {exc}")
+
+if st.session_state.plan:
+    st.subheader("Implementation Plan")
+    plan = st.session_state.plan
+
+    with st.expander("Problem Summary"):
+        st.write(plan.get("problem_summary", ""))
+
+    with st.expander("Project Type"):
+        st.write(plan.get("project_type", ""))
+
+    with st.expander("Requirements"):
+        st.write("\n".join(plan.get("requirements", []) or []))
+
+    with st.expander("Modules"):
+        st.write("\n".join(plan.get("modules", []) or []))
+
+    with st.expander("Functions"):
+        st.write("\n".join(plan.get("functions", []) or []))
+
+    with st.expander("Classes"):
+        st.write("\n".join(plan.get("classes", []) or []))
+
+    with st.expander("Libraries"):
+        st.write("\n".join(plan.get("external_libraries", []) or []))
+
+    with st.expander("Database Needed"):
+        st.write(plan.get("database_needed", False))
+
+    with st.expander("API Requirements"):
+        st.write("\n".join(plan.get("api_needed", []) or []))
+
+    with st.expander("Algorithm"):
+        st.write(plan.get("algorithm", ""))
+
+    with st.expander("Edge Cases"):
+        st.write("\n".join(plan.get("edge_cases", []) or []))
+
+    with st.expander("Estimated Complexity"):
+        st.write(plan.get("estimated_complexity", ""))
+
+    with st.expander("Future Improvements"):
+        st.write("\n".join(plan.get("future_improvements", []) or []))
+
 st.subheader("Generate Python code")
 prompt = st.text_area(
     "Programming request",
     height=150,
     placeholder="Create a Python calculator using functions",
 )
+
 
 code_placeholder = ""
 if "generated_code" not in st.session_state:
