@@ -23,6 +23,7 @@ class GeneratePlanRequest:
     """Request DTO for generating an implementation plan."""
 
     prompt: str
+    retrieved_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,10 @@ class GeneratePlanUseCase:
 
         logger.info("Planning started")
         try:
-            plan = self._planner_agent.create_plan(request.prompt)
+            plan = self._planner_agent.create_plan(
+                request.prompt,
+                retrieved_context=request.retrieved_context,
+            )
             logger.info("Planning completed")
             return GeneratePlanResult(plan=plan)
         except Exception:

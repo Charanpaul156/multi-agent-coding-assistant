@@ -7,4 +7,8 @@ tenacity
 google-genai
 streamlit
 requests
-
+pytest
+chromadb
+sentence-transformers
+# uvicorn backend.main:app --reload
+# streamlit run frontend/app.py

@@ -19,6 +19,7 @@ class GenerateCodeRequest:
     """Request DTO for generating code."""
 
     prompt: str
+    retrieved_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,10 @@ class GenerateCodeUseCase:
             raise ValueError("prompt must be non-empty")
 
         logger.info("GenerateCodeUseCase: start")
-        code = self._coder_agent.generate_code(request.prompt)
+        code = self._coder_agent.generate_code(
+            request.prompt,
+            retrieved_context=request.retrieved_context,
+        )
         logger.info("GenerateCodeUseCase: finished")
         return GenerateCodeResult(generated_code=code)
 

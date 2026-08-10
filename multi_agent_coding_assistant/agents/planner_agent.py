@@ -57,11 +57,21 @@ class PlannerAgent:
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client = llm_client
 
-    def create_plan(self, prompt: str) -> ImplementationPlan:
+    def create_plan(
+        self,
+        prompt: str,
+        *,
+        retrieved_context: str | None = None,
+    ) -> ImplementationPlan:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         if not prompt.strip():
             raise ValueError("prompt must be non-empty")
+
+        # Optionally prepend repository context to the user prompt. Agents
+        # never retrieve context internally; they only receive it as input.
+        if retrieved_context:
+            prompt = f"{retrieved_context}\n\n---\n\nUser request:\n{prompt}"
 
         system_prompt = (
             "You are a Senior Software Architect.\n"
