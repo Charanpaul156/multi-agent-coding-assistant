@@ -149,6 +149,10 @@ def get_run_workflow_use_case() -> RunWorkflowUseCase:
         test_execution_use_case=get_test_execution_use_case(),
         review_use_case=get_review_code_use_case(),
         debug_use_case=get_debug_code_use_case(),
+        repository_search_use_case=get_search_repository_use_case(),
+        repository_coder_agent=get_coder_agent(),
+        repository_modify_use_case=get_modify_repository_use_case(),
+        repository_debugger_agent=get_debugger_agent(),
         max_iterations=get_settings().max_iterations,
     )
 

@@ -93,10 +93,12 @@ class ModifyRepositoryRequest:
     reused. ``dry_run`` disables any write to disk.
     """
 
-    repository_path: str
-    request: str
+    repository_path: str = ""
+    request: str = ""
     dry_run: bool = False
     max_iterations: int = 3
+    change_set: Optional[ChangeSet] = None
+    repository_root: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,24 @@ class ModifyRepositoryResult:
     application: Optional[ApplicationResult] = None
     iterations: list[ChangeIteration] = field(default_factory=list)
     error: Optional[str] = None
+
+    @property
+    def validation_result(self) -> Optional[ValidationReport]:
+        return self.validation
+
+    @property
+    def diff(self) -> list[DiffEntry]:
+        return self.diffs
+
+    @property
+    def application_result(self) -> Optional[ApplicationResult]:
+        return self.application
+
+    @property
+    def applied_files(self) -> list[str]:
+        if self.application is not None:
+            return list(self.application.applied_files)
+        return []
 
 
 class ModifyRepositoryUseCase:
@@ -172,11 +192,60 @@ class ModifyRepositoryUseCase:
         """Run the repository-modification workflow."""
         self._validate_request(request)
 
+        repo_path = request.repository_path or request.repository_root or ""
+
         logger.info(
             "ModifyRepositoryUseCase: start repo=%r dry_run=%r",
-            request.repository_path,
+            repo_path,
             request.dry_run,
         )
+
+        # If a pre-generated change_set is passed directly:
+        if request.change_set is not None:
+            change_set = self._augment_original(request.change_set, repository_path=repo_path)
+            validation = self._validate(change_set)
+            diffs = self._build_diffs(change_set)
+
+            if not validation.valid:
+                return ModifyRepositoryResult(
+                    success=False,
+                    status=ModifyRepositoryStatus.VALIDATION_FAILED,
+                    repository_path=repo_path,
+                    dry_run=request.dry_run,
+                    change_set=change_set,
+                    validation=validation,
+                    diffs=diffs,
+                    error="proposed changes failed validation",
+                )
+
+            if request.dry_run:
+                return ModifyRepositoryResult(
+                    success=True,
+                    status=ModifyRepositoryStatus.PROPOSED,
+                    repository_path=repo_path,
+                    dry_run=True,
+                    change_set=change_set,
+                    validation=validation,
+                    diffs=diffs,
+                )
+
+            application = self._apply(change_set)
+            status = (
+                ModifyRepositoryStatus.APPLIED
+                if application.success
+                else ModifyRepositoryStatus.APPLICATION_FAILED
+            )
+            return ModifyRepositoryResult(
+                success=application.success,
+                status=status,
+                repository_path=repo_path,
+                dry_run=False,
+                change_set=change_set,
+                validation=validation,
+                diffs=diffs,
+                application=application,
+                error=application.error,
+            )
 
         # --- Stage 1: RAG context --------------------------------------
         context = self._retrieve_context(request)
@@ -203,7 +272,7 @@ class ModifyRepositoryUseCase:
             )
 
         # Populate original content/hash for modify operations.
-        change_set = self._augment_original(change_set)
+        change_set = self._augment_original(change_set, repository_path=request.repository_path)
 
         # --- Stage 4: Validate -----------------------------------------
         validation = self._validate(change_set)
@@ -354,7 +423,7 @@ class ModifyRepositoryUseCase:
                     feedback=feedback.error or "",
                     retrieved_context=self._retrieve_context(request),
                 )
-                corrected = self._augment_original(corrected)
+                corrected = self._augment_original(corrected, repository_path=request.repository_path)
             except Exception as exc:
                 logger.exception("ModifyRepositoryUseCase: debugger failed")
                 return ModifyRepositoryResult(
@@ -390,6 +459,7 @@ class ModifyRepositoryUseCase:
             current_set = corrected
             validation = new_validation
             diffs = self._build_diffs(current_set)
+
             iteration_number += 1
 
     # ------------------------------------------------------------------ #
@@ -399,10 +469,14 @@ class ModifyRepositoryUseCase:
     def _validate_request(self, request: ModifyRepositoryRequest) -> None:
         if not isinstance(request, ModifyRepositoryRequest):
             raise TypeError("request must be a ModifyRepositoryRequest")
-        if not isinstance(request.repository_path, str) or not request.repository_path.strip():
+
+        repo_path = request.repository_path or request.repository_root
+        if not repo_path or not isinstance(repo_path, str) or not repo_path.strip():
             raise ValueError("repository_path must be a non-empty string")
-        if not isinstance(request.request, str) or not request.request.strip():
-            raise ValueError("request must be a non-empty string")
+
+        if request.change_set is None:
+            if not isinstance(request.request, str) or not request.request.strip():
+                raise ValueError("request must be a non-empty string")
 
         # Ensure the repository path resolves inside an allowed root.
         if not self._config.allowed_repository_roots:
@@ -410,12 +484,12 @@ class ModifyRepositoryUseCase:
                 "no allowed repository roots configured; modification is disabled"
             )
         try:
-            root = Path(request.repository_path).expanduser().resolve()
+            root = Path(repo_path).expanduser().resolve()
         except OSError as exc:
-            raise ValueError(f"invalid repository path: {request.repository_path}") from exc
+            raise ValueError(f"invalid repository path: {repo_path}") from exc
         if not self._config.is_within_allowed_root(root):
             raise ValueError(
-                f"repository path outside allowed roots: {request.repository_path}"
+                f"repository path outside allowed roots: {repo_path}"
             )
 
     def _retrieve_context(self, request: ModifyRepositoryRequest) -> str:
@@ -438,7 +512,8 @@ class ModifyRepositoryUseCase:
         # Build a search request for the injected RAG use-case (duck-typed).
         from backend.application.rag_use_cases import SearchRepositoryRequest
 
-        repo = Path(request.repository_path).expanduser().resolve().name
+        repo_path = request.repository_path or request.repository_root or ""
+        repo = Path(repo_path).expanduser().resolve().name
         return SearchRepositoryRequest(query=request.request, repository=repo)
 
     def _plan(
@@ -485,33 +560,42 @@ class ModifyRepositoryUseCase:
     def _apply(self, change_set: ChangeSet) -> ApplicationResult:
         return self._applier.apply(change_set, dry_run=False)
 
-    def _augment_original(self, change_set: ChangeSet) -> ChangeSet:
+    def _augment_original(self, change_set: ChangeSet, repository_path: str = "") -> ChangeSet:
         """Populate original_content/original_hash for modify operations."""
         changed: list[FileChange] = []
         for change in change_set.changes:
             if change.operation != ChangeOperation.MODIFY:
                 changed.append(change)
                 continue
-            content, file_hash = self._read_current(change.file_path)
+            content, file_hash = self._read_current(change.file_path, repository_path=repository_path)
             changed.append(
                 FileChange(
                     file_path=change.file_path,
                     operation=change.operation,
                     new_content=change.new_content,
-                    original_content=content,
-                    original_hash=file_hash,
+                    original_content=content if content else change.original_content,
+                    original_hash=file_hash if file_hash else change.original_hash,
                     description=change.description,
                 )
             )
         return ChangeSet(changes=changed, summary=change_set.summary)
 
-    def _read_current(self, file_path: str) -> tuple[str, str]:
+    def _read_current(self, file_path: str, repository_path: str = "") -> tuple[str, str]:
         """Read the current on-disk content and hash for a repo-relative path."""
-        roots = self._config.allowed_repository_roots
-        root = Path(roots[0]).expanduser().resolve()
-        target = (root / file_path).resolve()
-        raw = target.read_bytes()
-        return raw.decode("utf-8", errors="replace"), hashlib.sha256(raw).hexdigest()
+        try:
+            if repository_path:
+                root = Path(repository_path).expanduser().resolve()
+            elif self._config and self._config.allowed_repository_roots:
+                root = Path(self._config.allowed_repository_roots[0]).expanduser().resolve()
+            else:
+                return "", ""
+            target = (root / file_path).resolve()
+            if not target.exists() or not target.is_file():
+                return "", ""
+            raw = target.read_bytes()
+            return raw.decode("utf-8", errors="replace"), hashlib.sha256(raw).hexdigest()
+        except Exception:
+            return "", ""
 
     def _validate_applied(self, change_set: ChangeSet, application: ApplicationResult):
         """Run tests + review against the applied changes.
@@ -548,14 +632,19 @@ class ModifyRepositoryUseCase:
                 feedback.ok = False
                 feedback.error = f"test generation failed: {exc}"
 
-        # --- Execute tests ---------------------------------------------
         test_execution: Optional[TestExecutionResponse] = None
         if generated_tests and self._test_execution_use_case is not None:
             try:
+                files_map = {
+                    c.file_path: c.new_content
+                    for c in change_set.changes
+                    if c.file_path.endswith(".py")
+                }
                 test_execution = self._test_execution_use_case.execute(
                     TestExecutionRequest(
                         generated_code=self._combined_source(change_set),
                         generated_tests=generated_tests,
+                        files=files_map if files_map else None,
                     )
                 )
                 feedback.test_execution = test_execution

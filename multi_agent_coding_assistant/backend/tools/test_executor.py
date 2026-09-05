@@ -24,8 +24,10 @@ This module is framework-agnostic and intended for dependency injection.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,13 +44,15 @@ class TestExecutionRequest:
     """Request DTO for executing generated pytest tests.
 
     ``generated_code`` is the application source; ``generated_tests`` is the
-    pytest test source. Both are required.
+    pytest test source. ``files`` is an optional mapping of relative file paths
+    to file contents for multi-file or named module execution.
     """
 
     __test__ = False
 
-    generated_code: str
-    generated_tests: str
+    generated_code: str = ""
+    generated_tests: str = ""
+    files: Optional[dict[str, str]] = None
 
 
 @dataclass(frozen=True)
@@ -114,8 +118,19 @@ class TestExecutor:
             request.generated_tests, str
         ):
             raise TypeError("generated_code and generated_tests must be strings")
-        if not request.generated_code.strip():
-            raise ValueError("generated_code must not be empty")
+
+        if request.files is not None:
+            if not isinstance(request.files, dict):
+                raise TypeError("files must be a dictionary if provided")
+            for k, v in request.files.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise TypeError("keys and values in files must be strings")
+
+        has_files = bool(request.files)
+        has_code = bool(request.generated_code.strip())
+
+        if not has_files and not has_code:
+            raise ValueError("Either generated_code or files must be provided and non-empty")
         if not request.generated_tests.strip():
             raise ValueError("generated_tests must not be empty")
 
@@ -124,10 +139,37 @@ class TestExecutor:
         try:
             # Create an isolated temporary directory.
             tmp_dir = Path(tempfile.mkdtemp(prefix="wfa_test_"))
-            app_file = tmp_dir / "generated_code.py"
-            test_file = tmp_dir / "test_generated.py"
 
-            app_file.write_text(request.generated_code, encoding="utf-8")
+            files_to_write: dict[str, str] = {}
+
+            # 1. Add explicit files if provided.
+            if request.files:
+                for rel_path, content in request.files.items():
+                    files_to_write[rel_path] = content
+
+            # 2. Parse embedded sections from generated_code if files not explicitly provided.
+            if not request.files and has_code:
+                parsed_sections = self._parse_code_sections(request.generated_code)
+                if parsed_sections:
+                    files_to_write.update(parsed_sections)
+
+            # 3. If target module file is still missing, infer module from test imports.
+            if has_code:
+                imported_modules = self._extract_imported_modules(request.generated_tests)
+                for mod in imported_modules:
+                    mod_filename = f"{mod}.py"
+                    if mod_filename not in files_to_write and mod not in ("generated_code", "pytest"):
+                        files_to_write[mod_filename] = request.generated_code
+
+                # Legacy/Fallback: always ensure generated_code.py is present if not already added.
+                if "generated_code.py" not in files_to_write:
+                    files_to_write["generated_code.py"] = request.generated_code
+
+            # Write all files safely preventing path traversal.
+            for rel_path, content in files_to_write.items():
+                self._safe_write_file(tmp_dir, rel_path, content)
+
+            test_file = tmp_dir / "test_generated.py"
             test_file.write_text(request.generated_tests, encoding="utf-8")
 
             logger.info("TestExecutor: running pytest in %s", tmp_dir)
@@ -163,6 +205,9 @@ class TestExecutor:
             logger.warning("TestExecutor: timeout")
             raise TestExecutorTimeoutError("Test execution timed out") from exc
 
+        except ValueError:
+            raise
+
         except FileNotFoundError as exc:
             # pytest (or python) not available.
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -194,14 +239,80 @@ class TestExecutor:
             # Guaranteed cleanup of the temporary directory.
             if tmp_dir is not None:
                 try:
-                    for f in tmp_dir.iterdir():
-                        try:
-                            f.unlink(missing_ok=True)
-                        except Exception:  # pragma: no cover
-                            logger.warning("Failed to remove %s", f)
-                    tmp_dir.rmdir()
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
                 except Exception:  # pragma: no cover
                     logger.warning("Failed to cleanup temp dir: %s", tmp_dir)
+
+    @staticmethod
+    def _safe_write_file(tmp_dir: Path, rel_path_str: str, content: str) -> Path:
+        """Write a file into tmp_dir, preventing path traversal."""
+        clean_path_str = rel_path_str.replace("\\", "/").lstrip("/")
+        target_path = (tmp_dir / clean_path_str).resolve()
+        base_dir = tmp_dir.resolve()
+
+        try:
+            target_path.relative_to(base_dir)
+        except ValueError:
+            raise ValueError(f"Path traversal attempt detected in file path: {rel_path_str}")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+
+        # Create __init__.py files in nested directories inside tmp_dir
+        curr = target_path.parent
+        while curr != base_dir and base_dir in curr.parents:
+            init_file = curr / "__init__.py"
+            if not init_file.exists():
+                init_file.write_text("", encoding="utf-8")
+            curr = curr.parent
+
+        return target_path
+
+    @staticmethod
+    def _parse_code_sections(code: str) -> dict[str, str]:
+        """Extract sections marked like '# === path/to/file.py (operation) ==='."""
+        sections: dict[str, str] = {}
+        pattern = re.compile(r"^# ===\s*(.*?)(?:\s*\([^)]*\))?\s*===\s*$", re.MULTILINE)
+        matches = list(pattern.finditer(code))
+        if not matches:
+            return sections
+
+        for i, match in enumerate(matches):
+            raw_path = match.group(1).strip()
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(code)
+            section_content = code[start:end].strip()
+            if raw_path and (raw_path.endswith(".py") or "." in raw_path):
+                sections[raw_path] = section_content
+
+        return sections
+
+    @staticmethod
+    def _extract_imported_modules(test_code: str) -> list[str]:
+        """Extract top-level custom imported module names from test source."""
+        modules: list[str] = []
+        try:
+            tree = ast.parse(test_code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top_mod = alias.name.split(".")[0]
+                        if top_mod not in modules:
+                            modules.append(top_mod)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        top_mod = node.module.split(".")[0]
+                        if top_mod not in modules:
+                            modules.append(top_mod)
+        except Exception:
+            for match in re.finditer(r"^\s*(?:from|import)\s+([a-zA-Z0-9_]+)", test_code, re.MULTILINE):
+                mod = match.group(1)
+                if mod not in modules:
+                    modules.append(mod)
+
+        stdlib_names = getattr(sys, "stdlib_module_names", set())
+        excluded = stdlib_names | {"pytest", "unittest", "conftest"}
+        return [m for m in modules if m not in excluded]
 
     @staticmethod
     def _parse_counts(stdout: str) -> tuple[Optional[int], Optional[int]]:

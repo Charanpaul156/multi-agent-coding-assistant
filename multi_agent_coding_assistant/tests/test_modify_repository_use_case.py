@@ -108,11 +108,35 @@ class FakeTestGen:
 
 
 class FakeTestExec:
-    def __init__(self, success=True, exit_code=0):
+    def __init__(self, success=True, exit_code=0, responses=None):
         self.success = success
         self.exit_code = exit_code
+        self.responses = list(responses) if responses is not None else None
+        self.calls = 0
 
     def execute(self, request):
+        self.calls += 1
+        if self.responses is not None:
+            if not self.responses:
+                raise AssertionError("No more test execution responses configured")
+            item = self.responses.pop(0)
+            if isinstance(item, tuple):
+                success, exit_code = item
+            else:
+                success = bool(item)
+                exit_code = 0 if success else 1
+            return type(
+                "R",
+                (),
+                {
+                    "success": success,
+                    "exit_code": exit_code,
+                    "stdout": "",
+                    "stderr": "" if success else "test failed",
+                    "passed": 1 if success else 0,
+                    "failed": 0 if success else 1,
+                },
+            )()
         return type(
             "R",
             (),
@@ -120,19 +144,28 @@ class FakeTestExec:
                 "success": self.success,
                 "exit_code": self.exit_code,
                 "stdout": "",
-                "stderr": "",
-                "passed": 1,
+                "stderr": "" if self.success else "test failed",
+                "passed": 1 if self.success else 0,
                 "failed": 0 if self.success else 1,
             },
         )()
 
 
 class FakeReview:
-    def __init__(self, score=90):
+    def __init__(self, score=90, scores=None):
         self.score = score
+        self.scores = list(scores) if scores is not None else None
+        self.calls = 0
 
     def execute(self, request):
-        return type("R", (), {"report": type("Rep", (), {"overall_score": self.score, "final_summary": "ok"})()})
+        self.calls += 1
+        if self.scores is not None:
+            if not self.scores:
+                raise AssertionError("No more review scores configured")
+            score = self.scores.pop(0)
+        else:
+            score = self.score
+        return type("R", (), {"report": type("Rep", (), {"overall_score": score, "final_summary": "ok"})()})
 
 
 class FakeDebugger:
@@ -310,13 +343,14 @@ def test_test_failure_triggers_debugger(config):
     debugger = FakeDebugger(corrected)
     uc = _build_use_case(
         config=config,
-        test_exec=FakeTestExec(success=False, exit_code=1),
+        test_exec=FakeTestExec(responses=[(False, 1), (True, 0)]),
         debugger=debugger,
     )
     result = uc.execute(_request(config, dry_run=False))
     # Debugger produces corrected changes; re-apply succeeds.
     assert result.success is True
     assert result.status == ModifyRepositoryStatus.APPLIED
+    assert len(result.iterations) == 2
 
 
 def test_max_iterations_reached(config):
@@ -355,12 +389,13 @@ def test_review_failure_triggers_debugger(config):
     corrected = ChangeSet(changes=[_create()])
     uc = _build_use_case(
         config=config,
-        review=FakeReview(score=30),
+        review=FakeReview(scores=[30, 90]),
         debugger=FakeDebugger(corrected),
     )
     result = uc.execute(_request(config, dry_run=False))
     assert result.success is True
     assert result.status == ModifyRepositoryStatus.APPLIED
+    assert len(result.iterations) == 2
 
 
 # ---------------------------------------------------------------------------

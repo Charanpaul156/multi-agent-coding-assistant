@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from backend.api.deps import (
     get_debug_code_use_case,
+    get_coder_agent,
     get_execute_code_use_case,
     get_generate_code_use_case,
     get_generate_plan_use_case,
@@ -52,6 +53,7 @@ from backend.application.modify_repository_use_cases import (
     ModifyRepositoryRequest,
     ModifyRepositoryUseCase,
 )
+from rag.context import format_retrieved_context
 
 logger = logging.getLogger(__name__)
 
@@ -507,6 +509,8 @@ def generate_tests(
 
 class RunWorkflowPayload(BaseModel):
     prompt: str = Field(..., min_length=1)
+    repository_root: str | None = None
+    apply_repository_changes: bool = False
 
 
 class WorkflowExecutionModel(BaseModel):
@@ -596,7 +600,13 @@ def run_workflow(
     logger.info("POST /run-workflow: request received")
     try:
         logger.info("POST /run-workflow: use-case started")
-        result = use_case.execute(WorkflowRequest(prompt=prompt))
+        result = use_case.execute(
+            WorkflowRequest(
+                prompt=prompt,
+                repository_root=(payload.repository_root or None),
+                apply_repository_changes=payload.apply_repository_changes,
+            )
+        )
         logger.info("POST /run-workflow: use-case finished")
 
         planning_model = None
@@ -913,28 +923,41 @@ def rag_status(
 
 
 class ModifyRepositoryPayload(BaseModel):
-    repository: str | None = Field(default=None, description="Repository id (falls back to any indexed repo)")
+    repository: str = Field(..., min_length=1, description="Repository identifier or configured repository root")
     request: str = Field(..., min_length=1, description="Natural-language modification request")
     dry_run: bool = True
+    apply: bool = False
 
 
-class ChangeModel(BaseModel):
+class ProposedChangeModel(BaseModel):
     file_path: str
     operation: str
+    new_content: str
     description: str | None = None
     original_hash: str | None = None
+
+
+class ModifyRepositoryDiffModel(BaseModel):
+    file_path: str
+    operation: str
+    diff_text: str
+
+
+class ModifyRepositoryValidationModel(BaseModel):
+    valid: bool
+    file_path: str
+    operation: str
+    messages: list[str] = []
 
 
 class ModifyRepositoryApiResponse(BaseModel):
     success: bool
     dry_run: bool
-    changes: list[ChangeModel] = []
-    diff: str | None = None
-    validation_errors: list[str] = []
+    proposed_changes: list[ProposedChangeModel] = []
+    diff: list[ModifyRepositoryDiffModel] = []
+    validation_results: list[ModifyRepositoryValidationModel] = []
     applied_files: list[str] = []
-    rollback: dict | None = None
     error: str | None = None
-    status: str | None = None
 
 
 @router.post(
@@ -946,84 +969,93 @@ def modify_repository(
     payload: ModifyRepositoryPayload,
     use_case: ModifyRepositoryUseCase = Depends(get_modify_repository_use_case),
 ) -> ModifyRepositoryApiResponse:
-    """Generate and (optionally) apply repository-aware code changes.
+    """Generate repository-aware changes and optionally apply them."""
 
-    The assistant retrieves repository context via RAG, plans, produces a
-    proposed ChangeSet, validates every path (blocking path traversal and
-    protected files), and only applies changes when ``dry_run`` is False.
-
-    Changes are never applied automatically in dry-run mode; the caller must
-    explicitly request application after inspecting the diff.
-    """
     request_text = (payload.request or "").strip()
     if not request_text:
         logger.warning("POST /modify-repository: empty request")
         raise HTTPException(status_code=400, detail="request must not be empty")
 
+    repository = (payload.repository or "").strip()
+    if not repository:
+        logger.warning("POST /modify-repository: empty repository")
+        raise HTTPException(status_code=400, detail="repository must not be empty")
+
     if payload.dry_run is None:
         raise HTTPException(status_code=400, detail="dry_run must be a boolean")
+    if not payload.dry_run and not payload.apply:
+        raise HTTPException(
+            status_code=400,
+            detail="apply must be true when dry_run is false",
+        )
 
     logger.info(
-        "POST /modify-repository: received (dry_run=%s, repository=%s)",
+        "POST /modify-repository: received (dry_run=%s, apply=%s, repository=%s)",
         payload.dry_run,
-        payload.repository,
+        payload.apply,
+        repository,
     )
     try:
         result = use_case.execute(
             ModifyRepositoryRequest(
-                repository_path=(payload.repository or "").strip(),
+                repository_path=repository,
                 request=request_text,
                 dry_run=payload.dry_run,
             )
         )
+
         change_set = getattr(result, "change_set", None)
-        changes = change_set.changes if change_set is not None else []
+        proposed_changes: list[ProposedChangeModel] = []
+        if change_set is not None and getattr(change_set, "changes", None):
+            proposed_changes = [
+                ProposedChangeModel(
+                    file_path=change.file_path,
+                    operation=change.operation.value if hasattr(change.operation, "value") else str(change.operation),
+                    new_content=change.new_content,
+                    description=change.description,
+                    original_hash=change.original_hash,
+                )
+                for change in change_set.changes
+            ]
 
-        diff = None
-        diffs = getattr(result, "diffs", []) or []
-        if diffs:
-            diff = "\n".join(d.diff_text for d in diffs)
+        diff_entries = getattr(result, "diffs", None) or getattr(result, "diff", []) or []
+        diff: list[ModifyRepositoryDiffModel] = [
+            ModifyRepositoryDiffModel(
+                file_path=entry.file_path,
+                operation=entry.operation.value if hasattr(entry.operation, "value") else str(entry.operation),
+                diff_text=entry.diff_text,
+            )
+            for entry in diff_entries
+        ]
 
-        validation_errors: list[str] = []
-        validation = getattr(result, "validation", None)
-        if validation is not None:
-            for r in getattr(validation, "results", []) or []:
-                validation_errors.extend(getattr(r, "messages", []) or [])
+        validation_report = getattr(result, "validation", None) or getattr(result, "validation_result", None)
+        validation_results: list[ModifyRepositoryValidationModel] = []
+        if validation_report is not None and hasattr(validation_report, "results"):
+            for val in validation_report.results:
+                validation_results.append(
+                    ModifyRepositoryValidationModel(
+                        valid=val.valid,
+                        file_path=val.file_path,
+                        operation=val.operation.value if hasattr(val.operation, "value") else str(val.operation),
+                        messages=list(val.messages) if hasattr(val, "messages") else [],
+                    )
+                )
 
+        application = getattr(result, "application", None) or getattr(result, "application_result", None)
         applied_files: list[str] = []
-        rollback: dict | None = None
-        application = getattr(result, "application", None)
-        if application is not None:
-            applied_files = list(getattr(application, "applied_files", []) or [])
-            records = getattr(application, "rollback_records", []) or []
-            rollback = {
-                "files": [
-                    {
-                        "file_path": r.file_path,
-                        "was_created": r.was_created,
-                    }
-                    for r in records
-                ]
-            }
+        if application is not None and hasattr(application, "applied_files"):
+            applied_files = list(application.applied_files)
+        elif hasattr(result, "applied_files"):
+            applied_files = list(result.applied_files)
 
         return ModifyRepositoryApiResponse(
             success=result.success,
             dry_run=result.dry_run,
-            changes=[
-                ChangeModel(
-                    file_path=c.file_path,
-                    operation=c.operation.value,
-                    description=c.description,
-                    original_hash=c.original_hash,
-                )
-                for c in changes
-            ],
+            proposed_changes=proposed_changes,
             diff=diff,
-            validation_errors=validation_errors,
+            validation_results=validation_results,
             applied_files=applied_files,
-            rollback=rollback,
             error=result.error,
-            status=(result.status.value if result.status is not None else None),
         )
     except TypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

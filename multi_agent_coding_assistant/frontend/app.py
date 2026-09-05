@@ -509,25 +509,26 @@ st.caption(
     "a configured allowed root."
 )
 
-if "mod_repo" not in st.session_state:
-    st.session_state.mod_repo = None
+if "modify_repository_result" not in st.session_state:
+    st.session_state.modify_repository_result = None
+
+if "modify_repository_proposal" not in st.session_state:
+    st.session_state.modify_repository_proposal = None
 
 mod_repo_path = st.text_input(
-    "Modify - Repository path",
+    "Repository",
     placeholder=r"C:\path\to\repository",
     key="mod_repo_path",
 )
 
 mod_request = st.text_area(
-    "Modify - Request",
+    "User request",
     height=100,
     placeholder="Add password reset functionality to this project",
     key="mod_request",
 )
 
-mod_dry_run = st.checkbox("Dry run (only show proposed changes, do not apply)", value=True)
-
-if st.button("Generate Changes (Plan)"):
+if st.button("Generate Changes"):
     if not mod_repo_path.strip():
         st.error("Repository path must not be empty")
     elif not mod_request.strip():
@@ -542,7 +543,8 @@ if st.button("Generate Changes (Plan)"):
                     json={
                         "repository": mod_repo_path.strip(),
                         "request": mod_request.strip(),
-                        "dry_run": mod_dry_run,
+                        "dry_run": True,
+                        "apply": False,
                     },
                     timeout=300,
                 )
@@ -550,7 +552,11 @@ if st.button("Generate Changes (Plan)"):
                 st.error(f"Modification failed: {resp.status_code} - {resp.text}")
             else:
                 data = resp.json()
-                st.session_state.mod_repo = data
+                st.session_state.modify_repository_result = data
+                st.session_state.modify_repository_proposal = {
+                    "repository": mod_repo_path.strip(),
+                    "request": mod_request.strip(),
+                }
                 if data.get("success", False):
                     st.success("Proposed changes generated")
                 else:
@@ -560,77 +566,105 @@ if st.button("Generate Changes (Plan)"):
         except Exception as exc:  # pragma: no cover
             st.error(f"Failed to modify repository: {exc}")
 
-if st.session_state.mod_repo:
-    mod = st.session_state.mod_repo
-    st.write(f"Status: {mod.get('status', '')}")
-    st.write(f"Dry run: {mod.get('dry_run', False)}")
+def _render_modify_repository_result(result: dict | None) -> None:
+    if not result:
+        return
 
-    if mod.get("error"):
-        st.error(mod.get("error"))
+    st.write(
+        "Application status: "
+        + (
+            "proposal generated"
+            if result.get("dry_run", True)
+            else ("applied" if result.get("success", False) else "failed")
+        )
+    )
+    st.write(f"Dry run: {result.get('dry_run', False)}")
 
-    if mod.get("validation_errors"):
-        st.subheader("Validation Issues")
-        for err in mod.get("validation_errors", []):
-            st.warning(err)
+    if result.get("error"):
+        st.error(result.get("error"))
 
-    changes = mod.get("changes", []) or []
-    if changes:
+    validation_results = result.get("validation_results", []) or []
+    if validation_results:
+        st.subheader("Validation Results")
+        for item in validation_results:
+            title = f"{item.get('file_path', '?')} - {item.get('operation', '?')}"
+            if item.get("valid"):
+                st.success(title)
+            else:
+                st.error(title)
+            if item.get("messages"):
+                for message in item.get("messages", []):
+                    st.write(f"- {message}")
+
+    proposed_changes = result.get("proposed_changes", []) or []
+    if proposed_changes:
         st.subheader("Proposed Changes")
-        for ch in changes:
-            st.markdown(
-                f"**{ch.get('operation', '')}** {ch.get('file_path', '')}"
-            )
-            if ch.get("description"):
-                st.write(ch.get("description", ""))
-            if ch.get("original_hash"):
-                st.caption(f"Original hash: {ch['original_hash'][:12]}...")
+        for change in proposed_changes:
+            title = f"{change.get('operation', '')}: {change.get('file_path', '')}"
+            with st.expander(title, expanded=False):
+                st.write(f"File: {change.get('file_path', '')}")
+                st.write(f"Operation: {change.get('operation', '')}")
+                st.write(f"Description: {change.get('description', '') or 'None'}")
+                if change.get("original_hash"):
+                    st.write(f"Original hash: {change.get('original_hash')}")
+                if change.get("new_content"):
+                    st.code(
+                        _normalize_newlines_for_display(change.get("new_content", "")),
+                        language="python",
+                    )
 
-    diff_text = mod.get("diff")
-    if diff_text:
-        st.subheader("Diff")
-        st.code(_normalize_newlines_for_display(diff_text), language="diff")
+    diff_entries = result.get("diff", []) or []
+    if diff_entries:
+        st.subheader("Unified Diff")
+        for entry in diff_entries:
+            with st.expander(
+                f"{entry.get('operation', '')}: {entry.get('file_path', '')}",
+                expanded=False,
+            ):
+                st.code(
+                    _normalize_newlines_for_display(entry.get("diff_text", "")),
+                    language="diff",
+                )
 
-    if mod.get("applied_files"):
-        st.subheader("Applied Files")
-        st.write("\n".join(mod.get("applied_files", [])))
+    applied_files = result.get("applied_files", []) or []
+    st.subheader("Application Status")
+    if result.get("success", False):
+        if result.get("dry_run", True):
+            st.info("Dry-run completed successfully. No files were modified.")
+        else:
+            st.success("Changes applied successfully.")
+    else:
+        st.warning("Repository modification did not complete successfully.")
 
-    if mod.get("rollback"):
-        st.caption("Rollback information captured for the applied transaction.")
+    if applied_files:
+        st.write("Applied files:")
+        for file_path in applied_files:
+            st.write(f"- {file_path}")
 
-    if not mod.get("dry_run", True) and not mod.get("success", False):
-        pass
+
+_render_modify_repository_result(st.session_state.modify_repository_result)
 
 st.markdown("---")
 st.markdown("### Apply Changes")
 st.caption(
-    "Apply button intentionally separate from generation. Only appears after "
-    "a successful dry-run proposal."
+    "This action is explicit. It re-runs the repository-modification pipeline "
+    "with dry_run disabled and apply enabled."
 )
-apply_target_repo = st.text_input(
-    "Apply - Repository path",
-    placeholder=r"C:\path\to\repository",
-    key="apply_repo_path",
-)
-apply_request = st.text_area(
-    "Apply - Request",
-    height=80,
-    placeholder="Apply the previously proposed changes",
-    key="apply_request",
-)
+
 if st.button("Apply Changes"):
-    if not apply_target_repo.strip():
-        st.error("Repository path must not be empty")
-    elif not apply_request.strip():
-        st.error("Request must not be empty")
+    proposal = st.session_state.modify_repository_proposal
+    if not proposal:
+        st.error("Generate changes first before applying them.")
     else:
         try:
             with st.spinner("Applying validated changes..."):
                 resp = requests.post(
                     f"{BACKEND_URL}/modify-repository",
                     json={
-                        "repository": apply_target_repo.strip(),
-                        "request": apply_request.strip(),
+                        "repository": proposal["repository"],
+                        "request": proposal["request"],
                         "dry_run": False,
+                        "apply": True,
                     },
                     timeout=300,
                 )
@@ -638,14 +672,11 @@ if st.button("Apply Changes"):
                 st.error(f"Apply failed: {resp.status_code} - {resp.text}")
             else:
                 data = resp.json()
-                st.session_state.mod_repo = data
+                st.session_state.modify_repository_result = data
                 if data.get("success", False):
                     st.success("Changes applied")
-                    st.write(f"Applied files: {', '.join(data.get('applied_files', []) or [])}")
                 else:
-                    st.warning(
-                        data.get("error", "Apply did not complete")
-                    )
+                    st.warning(data.get("error", "Apply did not complete"))
         except Exception as exc:  # pragma: no cover
             st.error(f"Failed to apply changes: {exc}")
 

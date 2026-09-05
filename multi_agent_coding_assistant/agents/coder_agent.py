@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List
 
 from backend.infrastructure.llm_client import LLMClient
@@ -45,6 +45,7 @@ class CoderAgent:
         self,
         prompt: str,
         *,
+        implementation_plan: Any | None = None,
         retrieved_context: str | None = None,
         plan_summary: str | None = None,
     ) -> ChangeSet:
@@ -52,6 +53,8 @@ class CoderAgent:
 
         Args:
             prompt: Natural language repository-modification request.
+            implementation_plan: Optional structured implementation plan. This
+                may be a dataclass, dict, or pre-rendered string.
             retrieved_context: Optional repository context (pre-formatted by
                 the RAG layer). The agent never retrieves context internally.
             plan_summary: Optional planner output to guide the changes.
@@ -69,6 +72,11 @@ class CoderAgent:
         if not prompt.strip():
             raise ValueError("prompt must be non-empty")
 
+        if plan_summary is None and implementation_plan is not None:
+            plan_summary = self._format_implementation_plan(
+                implementation_plan
+            )
+
         system_prompt = (
             "You are a senior software engineer performing repository-aware "
             "modification.\n"
@@ -81,6 +89,8 @@ class CoderAgent:
             "  \"operation\": \"create\" or \"modify\",\n"
             "  \"new_content\": string (COMPLETE new file content, full file, "
             "no Markdown fences, no truncation),\n"
+            "  \"original_hash\": string | null (optional; include when the "
+            "current file hash is known),\n"
             "  \"description\": string (concise)\n"
             "}\n"
             "Return a JSON object with the shape:\n"
@@ -93,6 +103,8 @@ class CoderAgent:
             "- Use POSIX '/' separators; NEVER use absolute paths or '..'.\n"
             "- Provide the COMPLETE file content for modified files, not a "
             "patch or a partial diff. Preserve unrelated existing content.\n"
+            "- If the current file hash is known, include original_hash so the "
+            "application layer can reject stale changes safely.\n"
             "- Do not include Markdown fences. Do not add explanations "
             "outside JSON."
         )
@@ -263,10 +275,17 @@ class CoderAgent:
                     f"change at index {idx} missing field: {key}"
                 )
 
+        for key in ("description",):
+            if key not in item:
+                raise CoderAgentError(
+                    f"change at index {idx} missing field: {key}"
+                )
+
         file_path = item["file_path"]
         operation_raw = item["operation"]
         new_content = item["new_content"]
-        description = item.get("description", "")
+        description = item["description"]
+        original_hash = item.get("original_hash", None)
 
         if not isinstance(file_path, str) or not file_path.strip():
             raise CoderAgentError(
@@ -281,6 +300,20 @@ class CoderAgent:
                 f"change at index {idx} has unsupported operation: "
                 f"{operation_raw} (only create/modify allowed in v1)"
             )
+        if "original_hash" in item and original_hash is not None and not isinstance(
+            original_hash, str
+        ):
+            raise CoderAgentError(
+                f"change at index {idx} has invalid original_hash"
+            )
+        if isinstance(original_hash, str) and not original_hash.strip():
+            raise CoderAgentError(
+                f"change at index {idx} has invalid original_hash"
+            )
+        if not isinstance(description, str):
+            raise CoderAgentError(
+                f"change at index {idx} has invalid description"
+            )
 
         operation = ChangeOperation(operation_raw)
         return FileChange(
@@ -288,9 +321,37 @@ class CoderAgent:
             operation=operation,
             new_content=new_content,
             original_content=None,
-            original_hash=None,
-            description=description if isinstance(description, str) else "",
+            original_hash=original_hash,
+            description=description,
         )
+
+    def _format_implementation_plan(self, implementation_plan: Any) -> str:
+        """Render implementation plan input for prompt construction."""
+        if isinstance(implementation_plan, str):
+            return implementation_plan.strip()
+
+        if is_dataclass(implementation_plan):
+            try:
+                payload = asdict(implementation_plan)
+            except Exception:
+                return str(implementation_plan)
+            return json.dumps(payload, indent=2, sort_keys=True, default=str)
+
+        if isinstance(implementation_plan, dict):
+            return json.dumps(implementation_plan, indent=2, sort_keys=True, default=str)
+
+        if hasattr(implementation_plan, "__dict__"):
+            try:
+                return json.dumps(
+                    vars(implementation_plan),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            except Exception:
+                return str(implementation_plan)
+
+        return str(implementation_plan)
 
 
 def _strip_markdown_code_fences(text: str) -> str:

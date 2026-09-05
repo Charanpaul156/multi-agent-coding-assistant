@@ -197,16 +197,20 @@ class ChangeValidator:
         if "\\" in file_path:
             # Backslashes could be drive separators / windows traversal.
             return "file_path must use POSIX '/' separators (no backslashes)"
-        if file_path.startswith("/") or file_path.startswith("\\"):
-            return "absolute paths are not allowed"
         if ".." in file_path.split("/"):
             return "path traversal ('..') is not allowed"
+
+        p = Path(file_path)
+        is_abs = p.is_absolute() or file_path.startswith("/") or file_path.startswith("\\")
 
         # Resolve and ensure within an allowed root.
         try:
             resolved = self._resolve_abs(file_path)
         except Exception as exc:
             return f"unable to resolve target path: {exc}"
+
+        if is_abs and not self.config.is_within_allowed_root(resolved):
+            return "absolute path is outside allowed repository root"
 
         if not self.config.is_within_allowed_root(resolved):
             return "target path is outside the allowed repository root"
@@ -217,17 +221,41 @@ class ChangeValidator:
         return None
 
     def _resolve_abs(self, file_path: str) -> Path:
-        """Return the resolved absolute Path for a repo-relative path.
+        """Return the resolved absolute Path for a change file_path.
 
-        The repo root is derived from the first configured allowed root.
-        file_path must be POSIX-relative and already validated as safe.
+        If file_path is absolute, resolve it directly.
+        Otherwise, check if it resolves to an existing file/directory outside the root,
+        or resolve it relative to the configured allowed repository roots.
         """
         roots = self.config.allowed_repository_roots
         if not roots:
             raise ChangeValidationError("no allowed repository roots configured")
 
-        root = Path(roots[0]).expanduser().resolve()
-        target = (root / file_path).resolve()
+        p = Path(file_path)
+        if p.is_absolute() or file_path.startswith("/") or file_path.startswith("\\"):
+            return p.resolve()
+
+        # Check if existing target in configured roots
+        for root_str in roots:
+            root_path = Path(root_str).expanduser().resolve()
+            candidate = (root_path / file_path).resolve()
+            if candidate.exists() and self.config.is_within_allowed_root(candidate):
+                return candidate
+
+        # Check if file_path resolves to an existing file/dir outside allowed roots
+        if p.is_file() or p.is_dir() or p.is_symlink():
+            resolved_p = p.resolve()
+            if not self.config.is_within_allowed_root(resolved_p):
+                return resolved_p
+
+        for root_str in roots:
+            root_path = Path(root_str).expanduser().resolve()
+            parent_candidate = (root_path.parent / file_path).resolve()
+            if (parent_candidate.exists() or parent_candidate.is_symlink()) and not self.config.is_within_allowed_root(parent_candidate):
+                return parent_candidate
+
+        primary_root = Path(roots[0]).expanduser().resolve()
+        target = (primary_root / file_path).resolve()
         return target
 
     def _is_protected(self, file_path: str) -> bool:

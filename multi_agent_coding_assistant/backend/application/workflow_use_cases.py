@@ -16,9 +16,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+from agents.coder_agent import CoderAgent
 from agents.planner_agent import ImplementationPlan
 from agents.code_reviewer_agent import ReviewReport
-from agents.debugger_agent import DebugReport
+from agents.debugger_agent import DebugReport, DebuggerAgent
 from backend.application.use_cases import (
     GenerateCodeRequest,
     GenerateCodeResult,
@@ -38,6 +39,11 @@ from backend.application.review_use_cases import (
     ReviewCodeResult,
     ReviewCodeUseCase,
 )
+from backend.application.modify_repository_use_cases import (
+    ModifyRepositoryRequest,
+    ModifyRepositoryResult,
+    ModifyRepositoryUseCase,
+)
 from backend.application.test_generation_use_cases import (
     GenerateTestsRequest,
     GenerateTestsResult,
@@ -53,6 +59,16 @@ from backend.tools.test_executor import (
     TestExecutionRequest,
     TestExecutionResponse,
 )
+from backend.application.rag_use_cases import (
+    SearchRepositoryRequest,
+    SearchRepositoryUseCase,
+)
+from backend.domain.change_models import (
+    ChangeSet,
+    DiffEntry,
+    ValidationReport,
+)
+from rag.context import format_retrieved_context
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +80,9 @@ class WorkflowStatus(str, Enum):
     COMPLETED_WITH_WARNINGS = "completed_with_warnings"
     PLANNING_FAILED = "planning_failed"
     CODING_FAILED = "coding_failed"
+    REPOSITORY_VALIDATION_FAILED = "repository_validation_failed"
+    REPOSITORY_APPLICATION_FAILED = "repository_application_failed"
+    REPOSITORY_PROPOSED = "repository_proposed"
     EXECUTION_FAILED = "execution_failed"
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     DEBUGGER_FAILED = "debugger_failed"
@@ -74,6 +93,8 @@ class WorkflowRequest:
     """Request DTO for running the full multi-agent workflow."""
 
     prompt: str
+    repository_root: Optional[str] = None
+    apply_repository_changes: bool = False
 
 
 @dataclass
@@ -99,6 +120,10 @@ class WorkflowIteration:
     debug_report: Optional[DebugReport] = None
     test_error: Optional[str] = None
     review_error: Optional[str] = None
+    repository_change_set: Optional[ChangeSet] = None
+    repository_validation: Optional[ValidationReport] = None
+    repository_diffs: List[DiffEntry] = field(default_factory=list)
+    repository_application: Optional[ModifyRepositoryResult] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +147,13 @@ class WorkflowResult:
     execution: Optional[ExecutionResponse] = None
     test_execution: Optional[TestExecutionResponse] = None
     review: Optional[ReviewReport] = None
+    repository_root: Optional[str] = None
+    repository_context: Optional[str] = None
+    repository_change_set: Optional[ChangeSet] = None
+    repository_validation: Optional[ValidationReport] = None
+    repository_diffs: List[DiffEntry] = field(default_factory=list)
+    repository_proposal: Optional[ModifyRepositoryResult] = None
+    repository_application: Optional[ModifyRepositoryResult] = None
     execution_time_ms: float = 0.0
     error: Optional[str] = None
     test_error: Optional[str] = None
@@ -180,6 +212,10 @@ class RunWorkflowUseCase:
         test_execution_use_case: ExecuteTestsUseCase,
         review_use_case: ReviewCodeUseCase,
         debug_use_case: Optional[DebugCodeUseCase] = None,
+        repository_search_use_case: Optional[SearchRepositoryUseCase] = None,
+        repository_coder_agent: Optional[CoderAgent] = None,
+        repository_modify_use_case: Optional[ModifyRepositoryUseCase] = None,
+        repository_debugger_agent: Optional[DebuggerAgent] = None,
         max_iterations: int = 3,
     ) -> None:
         self._plan_use_case = plan_use_case
@@ -189,6 +225,10 @@ class RunWorkflowUseCase:
         self._test_execution_use_case = test_execution_use_case
         self._review_use_case = review_use_case
         self._debug_use_case = debug_use_case
+        self._repository_search_use_case = repository_search_use_case
+        self._repository_coder_agent = repository_coder_agent
+        self._repository_modify_use_case = repository_modify_use_case
+        self._repository_debugger_agent = repository_debugger_agent
         self._max_iterations = max(1, int(max_iterations))
 
     def execute(self, request: WorkflowRequest) -> WorkflowResult:
@@ -203,6 +243,14 @@ class RunWorkflowUseCase:
 
         logger.info("Workflow Started (prompt=%r)", request.prompt)
         start = time.perf_counter()
+
+        repository_root = (request.repository_root or "").strip()
+        if repository_root:
+            return self._execute_repository_workflow(
+                request,
+                start,
+                repository_root=repository_root,
+            )
 
         # --- Stage 1: Planner ------------------------------------------------
         try:
@@ -359,6 +407,479 @@ class RunWorkflowUseCase:
             test_error=last.test_error,
             iterations=iterations,
         )
+
+    def _execute_repository_workflow(
+        self,
+        request: WorkflowRequest,
+        start: float,
+        *,
+        repository_root: str,
+    ) -> WorkflowResult:
+        """Run the repository-aware workflow branch."""
+
+        if self._repository_modify_use_case is None:
+            return self._fail(
+                "repository modification",
+                WorkflowStatus.REPOSITORY_APPLICATION_FAILED,
+                request.prompt,
+                start,
+                error="repository modify use-case is not available",
+            )
+        if self._repository_coder_agent is None:
+            return self._fail(
+                "repository coding",
+                WorkflowStatus.CODING_FAILED,
+                request.prompt,
+                start,
+                error="repository coder is not available",
+            )
+
+        repository_context = self._retrieve_repository_context(
+            request.prompt,
+            repository_root,
+        )
+
+        # --- Stage 1: Planner ----------------------------------------------
+        try:
+            plan_result: GeneratePlanResult = self._plan_use_case.execute(
+                GeneratePlanRequest(
+                    prompt=request.prompt,
+                    retrieved_context=repository_context or None,
+                )
+            )
+            planning = plan_result.plan
+            logger.info("Repository Planner Finished")
+        except Exception as exc:
+            logger.exception("Repository Planner FAILED")
+            return self._fail(
+                "repository planning",
+                WorkflowStatus.PLANNING_FAILED,
+                request.prompt,
+                start,
+                error=str(exc),
+            )
+
+        # --- Stage 2: Repository-aware coder -------------------------------
+        try:
+            change_set = self._repository_coder_agent.generate_changes(
+                request.prompt,
+                implementation_plan=planning,
+                retrieved_context=repository_context or None,
+            )
+            logger.info("Repository Coder Finished")
+        except Exception as exc:
+            logger.exception("Repository Coder FAILED")
+            return self._fail(
+                "repository coding",
+                WorkflowStatus.CODING_FAILED,
+                request.prompt,
+                start,
+                planning=planning,
+                error=str(exc),
+            )
+
+        # --- Stage 3: Validate / proposal dry run ---------------------------
+        proposal = self._repository_modify_use_case.execute(
+            ModifyRepositoryRequest(
+                repository_root=repository_root,
+                change_set=change_set,
+                dry_run=True,
+            )
+        )
+        initial_proposal = proposal
+        if not proposal.success:
+            status = (
+                WorkflowStatus.REPOSITORY_VALIDATION_FAILED
+                if proposal.validation_result is not None
+                and not proposal.validation_result.valid
+                else WorkflowStatus.REPOSITORY_APPLICATION_FAILED
+            )
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return WorkflowResult(
+                success=False,
+                workflow_status=status,
+                planning=planning,
+                generated_code=self._combined_repository_source(change_set),
+                generated_tests=None,
+                execution=None,
+                test_execution=None,
+                review=None,
+                repository_root=repository_root,
+                repository_context=repository_context or None,
+                repository_change_set=change_set,
+                repository_validation=proposal.validation_result,
+                repository_diffs=proposal.diff,
+                repository_proposal=initial_proposal,
+                repository_application=None,
+                execution_time_ms=elapsed_ms,
+                error=proposal.error,
+                test_error=None,
+                iterations=[],
+            )
+
+        if not request.apply_repository_changes:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return WorkflowResult(
+                success=True,
+                workflow_status=WorkflowStatus.REPOSITORY_PROPOSED,
+                planning=planning,
+                generated_code=self._combined_repository_source(change_set),
+                generated_tests=None,
+                execution=None,
+                test_execution=None,
+                review=None,
+                repository_root=repository_root,
+                repository_context=repository_context or None,
+                repository_change_set=change_set,
+                repository_validation=proposal.validation_result,
+                repository_diffs=proposal.diff,
+                repository_proposal=initial_proposal,
+                repository_application=None,
+                execution_time_ms=elapsed_ms,
+                error=None,
+                test_error=None,
+                iterations=[],
+            )
+
+        application = self._repository_modify_use_case.execute(
+            ModifyRepositoryRequest(
+                repository_root=repository_root,
+                change_set=change_set,
+                dry_run=False,
+            )
+        )
+        if not application.success:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return WorkflowResult(
+                success=False,
+                workflow_status=WorkflowStatus.REPOSITORY_APPLICATION_FAILED,
+                planning=planning,
+                generated_code=self._combined_repository_source(change_set),
+                generated_tests=None,
+                execution=None,
+                test_execution=None,
+                review=None,
+                repository_root=repository_root,
+                repository_context=repository_context or None,
+                repository_change_set=change_set,
+                repository_validation=proposal.validation_result,
+                repository_diffs=proposal.diff,
+                repository_proposal=initial_proposal,
+                repository_application=application,
+                execution_time_ms=elapsed_ms,
+                error=application.error,
+                test_error=None,
+                iterations=[],
+            )
+
+        iterations: List[WorkflowIteration] = []
+        iteration_number = 1
+        current_change_set = change_set
+        current_application = application
+        final_status: Optional[WorkflowStatus] = None
+        final_error: Optional[str] = None
+
+        while True:
+            iteration = self._run_repository_iteration(
+                change_set=current_change_set,
+                iteration_number=iteration_number,
+            )
+            iteration.repository_change_set = current_change_set
+            iteration.repository_validation = current_application.validation_result
+            iteration.repository_diffs = list(current_application.diff)
+            iteration.repository_application = current_application
+            iterations.append(iteration)
+
+            feedback = self._needs_debugging(iteration)
+            if feedback is None:
+                has_warnings = (
+                    iteration.test_error is not None
+                    or iteration.review_error is not None
+                    or iteration.review is None
+                )
+                final_status = (
+                    WorkflowStatus.COMPLETED_WITH_WARNINGS
+                    if has_warnings
+                    else WorkflowStatus.COMPLETED
+                )
+                final_error = iteration.review_error
+                break
+
+            if iteration_number >= self._max_iterations:
+                logger.warning(
+                    "Repository workflow reached maximum iterations (%d)",
+                    self._max_iterations,
+                )
+                final_status = WorkflowStatus.MAX_ITERATIONS_REACHED
+                break
+
+            if self._repository_debugger_agent is None:
+                logger.warning(
+                    "Repository debugger not available; stopping correction loop"
+                )
+                final_status = WorkflowStatus.DEBUGGER_FAILED
+                final_error = "Repository debugger not available"
+                break
+
+            try:
+                corrected = self._repository_debugger_agent.correct_changes(
+                    current_change_set,
+                    feedback=feedback,
+                    retrieved_context=repository_context or None,
+                )
+            except Exception as exc:
+                logger.exception("Repository debugger FAILED")
+                final_status = WorkflowStatus.DEBUGGER_FAILED
+                final_error = str(exc)
+                break
+
+            proposal = self._repository_modify_use_case.execute(
+                ModifyRepositoryRequest(
+                    repository_root=repository_root,
+                    change_set=corrected,
+                    dry_run=True,
+                )
+            )
+            if not proposal.success:
+                status = (
+                    WorkflowStatus.REPOSITORY_VALIDATION_FAILED
+                    if proposal.validation_result is not None
+                    and not proposal.validation_result.valid
+                    else WorkflowStatus.REPOSITORY_APPLICATION_FAILED
+                )
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                return WorkflowResult(
+                    success=False,
+                    workflow_status=status,
+                    planning=planning,
+                    generated_code=self._combined_repository_source(corrected),
+                    generated_tests=iteration.generated_tests,
+                    execution=None,
+                    test_execution=iteration.test_execution,
+                    review=iteration.review,
+                    repository_root=repository_root,
+                    repository_context=repository_context or None,
+                    repository_change_set=corrected,
+                    repository_validation=proposal.validation_result,
+                    repository_diffs=proposal.diff,
+                    repository_proposal=initial_proposal,
+                    repository_application=None,
+                    execution_time_ms=elapsed_ms,
+                    error=proposal.error,
+                    test_error=iteration.test_error,
+                    iterations=iterations,
+                )
+
+            application = self._repository_modify_use_case.execute(
+                ModifyRepositoryRequest(
+                    repository_root=repository_root,
+                    change_set=corrected,
+                    dry_run=False,
+                )
+            )
+            if not application.success:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                return WorkflowResult(
+                    success=False,
+                    workflow_status=WorkflowStatus.REPOSITORY_APPLICATION_FAILED,
+                    planning=planning,
+                    generated_code=self._combined_repository_source(corrected),
+                    generated_tests=iteration.generated_tests,
+                    execution=None,
+                    test_execution=iteration.test_execution,
+                    review=iteration.review,
+                    repository_root=repository_root,
+                    repository_context=repository_context or None,
+                    repository_change_set=corrected,
+                    repository_validation=proposal.validation_result,
+                    repository_diffs=proposal.diff,
+                    repository_proposal=initial_proposal,
+                    repository_application=application,
+                    execution_time_ms=elapsed_ms,
+                    error=application.error,
+                    test_error=iteration.test_error,
+                    iterations=iterations,
+                )
+
+            current_change_set = corrected
+            current_application = application
+            iteration_number += 1
+
+        last = iterations[-1]
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        success = final_status in (
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.COMPLETED_WITH_WARNINGS,
+        )
+
+        return WorkflowResult(
+            success=success,
+            workflow_status=final_status or WorkflowStatus.COMPLETED,
+            planning=planning,
+            generated_code=self._combined_repository_source(current_change_set),
+            generated_tests=last.generated_tests,
+            execution=None,
+            test_execution=last.test_execution,
+            review=last.review,
+            repository_root=repository_root,
+            repository_context=repository_context or None,
+            repository_change_set=current_change_set,
+            repository_validation=current_application.validation_result,
+            repository_diffs=list(current_application.diff),
+            repository_proposal=initial_proposal,
+            repository_application=current_application,
+            execution_time_ms=elapsed_ms,
+            error=final_error,
+            test_error=last.test_error,
+            iterations=iterations,
+        )
+
+    def _retrieve_repository_context(
+        self,
+        prompt: str,
+        repository_root: str,
+    ) -> str:
+        """Retrieve and format repository context for repo-aware requests."""
+
+        if self._repository_search_use_case is None:
+            return ""
+
+        try:
+            result = self._repository_search_use_case.execute(
+                SearchRepositoryRequest(
+                    query=prompt,
+                    repository=repository_root,
+                )
+            )
+            return format_retrieved_context(result.results)
+        except Exception as exc:
+            logger.warning("Repository context retrieval failed: %s", exc)
+            return ""
+
+    def _run_repository_iteration(
+        self,
+        *,
+        change_set: ChangeSet,
+        iteration_number: int,
+    ) -> WorkflowIteration:
+        """Run one repository-aware iteration without code execution."""
+
+        logger.info("Repository workflow iteration %d: starting", iteration_number)
+        generated_source = self._combined_repository_source(change_set)
+
+        generated_tests: Optional[str] = None
+        test_error: Optional[str] = None
+        try:
+            test_result: GenerateTestsResult = self._test_generation_use_case.execute(
+                GenerateTestsRequest(generated_code=generated_source)
+            )
+            generated_tests = test_result.report.generated_test_code
+            logger.info(
+                "Repository workflow iteration %d: Test Generator finished",
+                iteration_number,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Repository workflow iteration %d: Test Generator FAILED (continuing): %s",
+                iteration_number,
+                exc,
+            )
+            generated_tests = None
+            test_error = str(exc)
+
+        test_execution: Optional[TestExecutionResponse] = None
+        if generated_tests is not None:
+            try:
+                repo_files = {
+                    c.file_path: c.new_content
+                    for c in change_set.changes
+                    if c.file_path.endswith(".py")
+                }
+                test_execution = self._test_execution_use_case.execute(
+                    TestExecutionRequest(
+                        generated_code=generated_source,
+                        generated_tests=generated_tests,
+                        files=repo_files if repo_files else None,
+                    )
+                )
+                logger.info(
+                    "Repository workflow iteration %d: Test Execution finished",
+                    iteration_number,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Repository workflow iteration %d: Test Execution FAILED (continuing): %s",
+                    iteration_number,
+                    exc,
+                )
+                test_execution = None
+        else:
+            logger.info(
+                "Repository workflow iteration %d: Test Execution SKIPPED (no tests)",
+                iteration_number,
+            )
+
+        review: Optional[ReviewReport] = None
+        review_error: Optional[str] = None
+        try:
+            review_result: ReviewCodeResult = self._review_use_case.execute(
+                ReviewCodeRequest(
+                    generated_code=generated_source,
+                    stdout=None,
+                    stderr=None,
+                    exit_code=None,
+                    generated_tests=generated_tests,
+                    test_stdout=(test_execution.stdout if test_execution else None),
+                    test_stderr=(test_execution.stderr if test_execution else None),
+                    test_exit_code=(
+                        test_execution.exit_code if test_execution else None
+                    ),
+                )
+            )
+            review = review_result.report
+            logger.info(
+                "Repository workflow iteration %d: Reviewer finished",
+                iteration_number,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Repository workflow iteration %d: Reviewer FAILED (continuing): %s",
+                iteration_number,
+                exc,
+            )
+            review = None
+            review_error = str(exc)
+
+        return WorkflowIteration(
+            iteration_number=iteration_number,
+            generated_code=generated_source,
+            generated_tests=generated_tests,
+            execution=None,
+            test_execution=test_execution,
+            review=review,
+            debug_report=None,
+            test_error=test_error,
+            review_error=review_error,
+            repository_change_set=change_set,
+            repository_validation=None,
+            repository_diffs=[],
+            repository_application=None,
+        )
+
+    @staticmethod
+    def _combined_repository_source(change_set: ChangeSet) -> str:
+        """Combine Python file contents from a ChangeSet for analysis."""
+
+        parts: List[str] = []
+        for change in change_set.changes:
+            if change.file_path.endswith(".py"):
+                parts.append(
+                    f"# === {change.file_path} ({change.operation.value}) ===\n"
+                    + change.new_content
+                )
+        if not parts:
+            parts.append(change_set.summary or "# no python changes")
+        return "\n\n".join(parts)
 
     def _run_iteration(
         self,
