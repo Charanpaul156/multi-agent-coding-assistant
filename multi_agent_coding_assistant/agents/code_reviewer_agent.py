@@ -114,6 +114,14 @@ class ReviewerAgent:
             "Do not rewrite the implementation.\n"
             "Only review and provide structured feedback.\n"
             "Never execute code. Never modify code. Only analyze.\n"
+            "If there are no issues or concerns for a category, return an empty array [].\n"
+            "Do not return placeholder strings such as:\n"
+            "- \"None\"\n"
+            "- \"None.\"\n"
+            "- \"No issues\"\n"
+            "- \"No security concerns\"\n"
+            "- \"No logic issues\"\n"
+            "- \"N/A\"\n"
             "Return ONLY structured review information as valid JSON.\n"
             "The JSON MUST match the following schema:\n"
             "{\n"
@@ -265,6 +273,44 @@ class ReviewerAgent:
                 )
             return value
 
+        def _is_no_issue_placeholder(item: str) -> bool:
+            cleaned = item.strip().lower()
+            if not cleaned:
+                return True
+            placeholders = (
+                "none",
+                "none.",
+                "no issues",
+                "no issue",
+                "no logic issues",
+                "no security concerns",
+                "no pep8 issues",
+                "no pep 8 issues",
+                "n/a",
+                "not applicable",
+            )
+            for p in placeholders:
+                if (
+                    cleaned == p
+                    or cleaned.startswith(p + " ")
+                    or cleaned.startswith(p + ".")
+                    or cleaned.startswith(p + ":")
+                    or cleaned.startswith(p + ",")
+                    or cleaned.startswith(p + " -")
+                ):
+                    return True
+            return False
+
+        def _normalize_issue_list(value: Any) -> List[str]:
+            raw_items = as_str_list(value)
+            normalized: List[str] = []
+            for item in raw_items:
+                stripped = item.strip()
+                if not stripped or _is_no_issue_placeholder(stripped):
+                    continue
+                normalized.append(stripped)
+            return normalized
+
         if not isinstance(data["overall_score"], int) or isinstance(
             data["overall_score"], bool
         ):
@@ -280,12 +326,12 @@ class ReviewerAgent:
             overall_score=data["overall_score"],
             strengths=as_str_list(data["strengths"]),
             weaknesses=as_str_list(data["weaknesses"]),
-            pep8_issues=as_str_list(data["pep8_issues"]),
+            pep8_issues=_normalize_issue_list(data["pep8_issues"]),
             performance_suggestions=as_str_list(
                 data["performance_suggestions"]
             ),
-            security_concerns=as_str_list(data["security_concerns"]),
-            logic_issues=as_str_list(data["logic_issues"]),
+            security_concerns=_normalize_issue_list(data["security_concerns"]),
+            logic_issues=_normalize_issue_list(data["logic_issues"]),
             maintainability=as_str_list(data["maintainability"]),
             error_handling=as_str_list(data["error_handling"]),
             recommendations=as_str_list(data["recommendations"]),

@@ -12,6 +12,7 @@ from __future__ import annotations
 from agents.planner_agent import ImplementationPlan
 from agents.code_reviewer_agent import ReviewReport
 from agents.debugger_agent import DebugReport
+from agents.documentation_agent import DocumentationReport
 from backend.application.debugging_use_cases import (
     DebugCodeRequest,
     DebugCodeResult,
@@ -114,8 +115,10 @@ class FakeTestGeneration:
     def __init__(self, tests=None, exc=None):
         self.tests = tests
         self.exc = exc
+        self.calls = 0
 
     def execute(self, request):
+        self.calls += 1
         if self.exc is not None:
             raise self.exc
 
@@ -146,9 +149,11 @@ class FakeTestExecute:
         self.responses = list(responses or [])
         self.exc = exc
         self.calls = 0
+        self.captured_requests = []
 
     def execute(self, request):
         self.calls += 1
+        self.captured_requests.append(request)
         if self.exc is not None:
             raise self.exc
         if not self.responses:
@@ -279,6 +284,24 @@ def test_reviewer_critical_logic_issue_triggers_debugger() -> None:
     assert result.iterations[0].debug_report is not None
 
 
+class FakeDocUseCase:
+    def __init__(self, report=None):
+        self.report = report or DocumentationReport(
+            summary="Doc summary",
+            module_description="Doc desc",
+            function_docs=[],
+            class_docs=[],
+            usage_examples=["example"],
+            markdown_documentation="# Docs",
+        )
+
+    def execute(self, request):
+        class _R:
+            def __init__(self, report):
+                self.report = report
+        return _R(self.report)
+
+
 def test_reviewer_non_critical_does_not_trigger_debugger() -> None:
     non_crit = make_review(
         overall_score=85,
@@ -292,6 +315,35 @@ def test_reviewer_non_critical_does_not_trigger_debugger() -> None:
     assert result.workflow_status == WorkflowStatus.COMPLETED
     assert len(result.iterations) == 1
     assert result.iterations[0].debug_report is None
+
+
+def test_reviewer_placeholder_issues_does_not_trigger_debugger_and_completes() -> None:
+    review_placeholder = make_review(
+        overall_score=98,
+        logic_issues=["None. The function is correct."],
+        security_concerns=["None. No security concerns."],
+    )
+    doc_use_case = FakeDocUseCase()
+    run = build_workflow(
+        review_use_case=FakeReview(reports=[review_placeholder]),
+        documentation_use_case=doc_use_case,
+    )
+    assert run._needs_debugging(
+        type("It", (), {
+            "execution": _ok_exec(),
+            "test_execution": _ok_test(),
+            "review": review_placeholder,
+        })()
+    ) is None
+
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert len(result.iterations) == 1
+    assert result.iterations[0].debug_report is None
+    assert result.documentation is not None
+    assert result.documentation.summary == "Doc summary"
 
 
 def test_corrected_code_still_fails_continues_loop() -> None:
@@ -395,3 +447,136 @@ def test_reviewer_low_score_triggers_debugger() -> None:
     assert result.success is True
     assert len(result.iterations) == 2
     assert result.iterations[0].debug_report is not None
+
+
+class RotatingFakeTestGeneration:
+    """Test generator fake that returns different suites per call to detect unwanted regeneration."""
+
+    def __init__(self, suites):
+        self.suites = list(suites)
+        self.calls = 0
+
+    def execute(self, request):
+        self.calls += 1
+        suite = self.suites.pop(0) if self.suites else "def test_fallback(): pass"
+        return type("TResult", (), {"report": type("T", (), {"generated_test_code": suite})()})()
+
+
+class FakeDocumentation:
+    def __init__(self, report=None, exc=None):
+        self.report = report or DocumentationReport(
+            summary="Docs complete",
+            module_description="Divides two numbers",
+            function_docs=[{"name": "divide", "description": "Divide a by b"}],
+            class_docs=[],
+            usage_examples=["divide(4, 2)"],
+            markdown_documentation="# Divide Module\nDocs complete",
+        )
+        self.exc = exc
+        self.calls = 0
+
+    def execute(self, request):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return type("DocResult", (), {"report": self.report})()
+
+
+def test_self_correction_reuses_test_suite_without_regenerating() -> None:
+    """A. Test suite is generated once and reused across correction iterations."""
+    test_gen = RotatingFakeTestGeneration(
+        ["def test_suite_alpha(): pass", "def test_suite_beta(): pass"]
+    )
+    test_exec = FakeTestExecute(responses=[_fail_test(), _ok_test()])
+    corrected = "def divide(a, b):\n    return a / b if b != 0 else None\n"
+
+    run = build_workflow(
+        test_generation_use_case=test_gen,
+        test_execution_use_case=test_exec,
+        debug_use_case=FakeDebug(reports=[make_debug_report(corrected)]),
+        review_use_case=FakeReview(reports=[make_review(), make_review()]),
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert len(result.iterations) == 2
+
+    # Test generator was called ONLY ONCE on iteration 1, not on iteration 2
+    assert test_gen.calls == 1
+    # Both iterations used the exact same test suite
+    assert result.iterations[0].generated_tests == "def test_suite_alpha(): pass"
+    assert result.iterations[1].generated_tests == "def test_suite_alpha(): pass"
+
+    # Validation was not bypassed: TestExecutor was invoked on both iterations
+    assert test_exec.calls == 2
+    # Second execution executed the corrected code against the reused tests
+    assert test_exec.captured_requests[1].generated_code == corrected
+    assert test_exec.captured_requests[1].generated_tests == "def test_suite_alpha(): pass"
+
+
+def test_self_correction_converges_and_avoids_max_iterations() -> None:
+    """B. Self-correction converges to COMPLETED when corrected code passes same tests."""
+    test_exec = FakeTestExecute(responses=[_fail_test(), _ok_test()])
+    run = build_workflow(
+        test_execution_use_case=test_exec,
+        debug_use_case=FakeDebug(
+            reports=[make_debug_report("def divide(a, b):\n    return a / b\n")]
+        ),
+        review_use_case=FakeReview(reports=[make_review(), make_review()]),
+        max_iterations=3,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert result.workflow_status != WorkflowStatus.MAX_ITERATIONS_REACHED
+    assert len(result.iterations) == 2
+
+
+def test_self_correction_no_validation_bypass() -> None:
+    """C. Every correction iteration actually executes tests and doesn't bypass validation."""
+    test_exec = FakeTestExecute(responses=[_fail_test(), _fail_test(), _ok_test()])
+    run = build_workflow(
+        test_execution_use_case=test_exec,
+        debug_use_case=FakeDebug(
+            reports=[
+                make_debug_report("def divide(a, b): return 'bad'"),
+                make_debug_report("def divide(a, b): return a / b"),
+            ]
+        ),
+        review_use_case=FakeReview(reports=[make_review(), make_review(), make_review()]),
+        max_iterations=3,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert len(result.iterations) == 3
+    # All 3 iterations genuinely ran through TestExecutor
+    assert test_exec.calls == 3
+    assert test_exec.captured_requests[0].generated_code == "def divide(a,b): return a/b"
+    assert test_exec.captured_requests[1].generated_code == "def divide(a, b): return 'bad'"
+    assert test_exec.captured_requests[2].generated_code == "def divide(a, b): return a / b"
+
+
+def test_self_correction_convergence_allows_documentation_generation() -> None:
+    """E. Successful convergence from self-correction produces documentation."""
+    test_exec = FakeTestExecute(responses=[_fail_test(), _ok_test()])
+    doc_use_case = FakeDocumentation()
+
+    run = build_workflow(
+        test_execution_use_case=test_exec,
+        debug_use_case=FakeDebug(
+            reports=[make_debug_report("def divide(a, b):\n    return a / b\n")]
+        ),
+        review_use_case=FakeReview(reports=[make_review(), make_review()]),
+        documentation_use_case=doc_use_case,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert doc_use_case.calls == 1
+    assert result.documentation is not None
+    assert result.documentation.summary == "Docs complete"
+

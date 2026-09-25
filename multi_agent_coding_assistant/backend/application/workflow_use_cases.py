@@ -20,6 +20,7 @@ from agents.coder_agent import CoderAgent
 from agents.planner_agent import ImplementationPlan
 from agents.code_reviewer_agent import ReviewReport
 from agents.debugger_agent import DebugReport, DebuggerAgent
+from agents.documentation_agent import DocumentationReport
 from backend.application.use_cases import (
     GenerateCodeRequest,
     GenerateCodeResult,
@@ -28,6 +29,10 @@ from backend.application.use_cases import (
 from backend.application.debugging_use_cases import (
     DebugCodeRequest,
     DebugCodeUseCase,
+)
+from backend.application.documentation_use_cases import (
+    GenerateDocumentationRequest,
+    GenerateDocumentationUseCase,
 )
 from backend.application.planning_use_cases import (
     GeneratePlanRequest,
@@ -158,6 +163,8 @@ class WorkflowResult:
     error: Optional[str] = None
     test_error: Optional[str] = None
     iterations: List[WorkflowIteration] = field(default_factory=list)
+    documentation: Optional[DocumentationReport] = None
+    documentation_error: Optional[str] = None
 
 
 class RunWorkflowUseCase:
@@ -216,6 +223,7 @@ class RunWorkflowUseCase:
         repository_coder_agent: Optional[CoderAgent] = None,
         repository_modify_use_case: Optional[ModifyRepositoryUseCase] = None,
         repository_debugger_agent: Optional[DebuggerAgent] = None,
+        documentation_use_case: Optional[GenerateDocumentationUseCase] = None,
         max_iterations: int = 3,
     ) -> None:
         self._plan_use_case = plan_use_case
@@ -229,6 +237,7 @@ class RunWorkflowUseCase:
         self._repository_coder_agent = repository_coder_agent
         self._repository_modify_use_case = repository_modify_use_case
         self._repository_debugger_agent = repository_debugger_agent
+        self._documentation_use_case = documentation_use_case
         self._max_iterations = max(1, int(max_iterations))
 
     def execute(self, request: WorkflowRequest) -> WorkflowResult:
@@ -292,13 +301,17 @@ class RunWorkflowUseCase:
         iteration_number = 1
         final_status: Optional[WorkflowStatus] = None
         final_error: Optional[str] = None
+        stable_tests: Optional[str] = None
 
         while True:
             iteration = self._run_iteration(
                 generated_code=current_code,
                 iteration_number=iteration_number,
+                existing_tests=stable_tests,
             )
             iterations.append(iteration)
+            if stable_tests is None and iteration.generated_tests is not None:
+                stable_tests = iteration.generated_tests
 
             feedback = self._needs_debugging(iteration)
 
@@ -393,6 +406,19 @@ class RunWorkflowUseCase:
             WorkflowStatus.COMPLETED_WITH_WARNINGS,
         )
 
+        documentation: Optional[DocumentationReport] = None
+        documentation_error: Optional[str] = None
+        if success and self._documentation_use_case is not None:
+            (
+                documentation,
+                documentation_error,
+                final_status,
+            ) = self._generate_workflow_documentation(
+                code=last.generated_code,
+                retrieved_context=None,
+                final_status=final_status or WorkflowStatus.COMPLETED,
+            )
+
         return WorkflowResult(
             success=success,
             workflow_status=final_status or WorkflowStatus.COMPLETED,
@@ -406,6 +432,8 @@ class RunWorkflowUseCase:
             error=final_error,
             test_error=last.test_error,
             iterations=iterations,
+            documentation=documentation,
+            documentation_error=documentation_error,
         )
 
     def _execute_repository_workflow(
@@ -578,17 +606,21 @@ class RunWorkflowUseCase:
         current_application = application
         final_status: Optional[WorkflowStatus] = None
         final_error: Optional[str] = None
+        stable_tests: Optional[str] = None
 
         while True:
             iteration = self._run_repository_iteration(
                 change_set=current_change_set,
                 iteration_number=iteration_number,
+                existing_tests=stable_tests,
             )
             iteration.repository_change_set = current_change_set
             iteration.repository_validation = current_application.validation_result
             iteration.repository_diffs = list(current_application.diff)
             iteration.repository_application = current_application
             iterations.append(iteration)
+            if stable_tests is None and iteration.generated_tests is not None:
+                stable_tests = iteration.generated_tests
 
             feedback = self._needs_debugging(iteration)
             if feedback is None:
@@ -712,6 +744,19 @@ class RunWorkflowUseCase:
             WorkflowStatus.COMPLETED_WITH_WARNINGS,
         )
 
+        documentation: Optional[DocumentationReport] = None
+        documentation_error: Optional[str] = None
+        if success and self._documentation_use_case is not None:
+            (
+                documentation,
+                documentation_error,
+                final_status,
+            ) = self._generate_workflow_documentation(
+                code=self._combined_repository_source(current_change_set),
+                retrieved_context=repository_context or None,
+                final_status=final_status or WorkflowStatus.COMPLETED,
+            )
+
         return WorkflowResult(
             success=success,
             workflow_status=final_status or WorkflowStatus.COMPLETED,
@@ -732,6 +777,8 @@ class RunWorkflowUseCase:
             error=final_error,
             test_error=last.test_error,
             iterations=iterations,
+            documentation=documentation,
+            documentation_error=documentation_error,
         )
 
     def _retrieve_repository_context(
@@ -761,31 +808,38 @@ class RunWorkflowUseCase:
         *,
         change_set: ChangeSet,
         iteration_number: int,
+        existing_tests: Optional[str] = None,
     ) -> WorkflowIteration:
         """Run one repository-aware iteration without code execution."""
 
         logger.info("Repository workflow iteration %d: starting", iteration_number)
         generated_source = self._combined_repository_source(change_set)
 
-        generated_tests: Optional[str] = None
+        generated_tests: Optional[str] = existing_tests
         test_error: Optional[str] = None
-        try:
-            test_result: GenerateTestsResult = self._test_generation_use_case.execute(
-                GenerateTestsRequest(generated_code=generated_source)
-            )
-            generated_tests = test_result.report.generated_test_code
+        if generated_tests is None:
+            try:
+                test_result: GenerateTestsResult = self._test_generation_use_case.execute(
+                    GenerateTestsRequest(generated_code=generated_source)
+                )
+                generated_tests = test_result.report.generated_test_code
+                logger.info(
+                    "Repository workflow iteration %d: Test Generator finished",
+                    iteration_number,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Repository workflow iteration %d: Test Generator FAILED (continuing): %s",
+                    iteration_number,
+                    exc,
+                )
+                generated_tests = None
+                test_error = str(exc)
+        else:
             logger.info(
-                "Repository workflow iteration %d: Test Generator finished",
+                "Repository workflow iteration %d: Test Generator reused existing tests",
                 iteration_number,
             )
-        except Exception as exc:
-            logger.warning(
-                "Repository workflow iteration %d: Test Generator FAILED (continuing): %s",
-                iteration_number,
-                exc,
-            )
-            generated_tests = None
-            test_error = str(exc)
 
         test_execution: Optional[TestExecutionResponse] = None
         if generated_tests is not None:
@@ -886,6 +940,7 @@ class RunWorkflowUseCase:
         *,
         generated_code: str,
         iteration_number: int,
+        existing_tests: Optional[str] = None,
     ) -> WorkflowIteration:
         """Run one full pipeline pass and return a WorkflowIteration.
 
@@ -895,22 +950,28 @@ class RunWorkflowUseCase:
         logger.info("Workflow iteration %d: starting", iteration_number)
 
         # --- Test Generator -------------------------------------------------
-        generated_tests: Optional[str] = None
+        generated_tests: Optional[str] = existing_tests
         test_error: Optional[str] = None
-        try:
-            test_result: GenerateTestsResult = self._test_generation_use_case.execute(
-                GenerateTestsRequest(generated_code=generated_code)
-            )
-            generated_tests = test_result.report.generated_test_code
-            logger.info("Workflow iteration %d: Test Generator finished", iteration_number)
-        except Exception as exc:
-            logger.warning(
-                "Workflow iteration %d: Test Generator FAILED (continuing): %s",
+        if generated_tests is None:
+            try:
+                test_result: GenerateTestsResult = self._test_generation_use_case.execute(
+                    GenerateTestsRequest(generated_code=generated_code)
+                )
+                generated_tests = test_result.report.generated_test_code
+                logger.info("Workflow iteration %d: Test Generator finished", iteration_number)
+            except Exception as exc:
+                logger.warning(
+                    "Workflow iteration %d: Test Generator FAILED (continuing): %s",
+                    iteration_number,
+                    exc,
+                )
+                generated_tests = None
+                test_error = str(exc)
+        else:
+            logger.info(
+                "Workflow iteration %d: Test Generator reused existing tests",
                 iteration_number,
-                exc,
             )
-            generated_tests = None
-            test_error = str(exc)
 
         # --- Application Execution ------------------------------------------
         execution: Optional[ExecutionResponse] = None
@@ -996,6 +1057,42 @@ class RunWorkflowUseCase:
             review_error=review_error,
         )
 
+    @staticmethod
+    def _has_genuine_issues(issues: List[str]) -> bool:
+        """Check if an issue list contains genuine actionable issues rather than placeholders."""
+        no_issue_prefixes = (
+            "none",
+            "no issues",
+            "no issue",
+            "no logic issues",
+            "no security concerns",
+            "no pep8 issues",
+            "no pep 8 issues",
+            "n/a",
+            "not applicable",
+        )
+        for issue in issues:
+            if not isinstance(issue, str):
+                continue
+            cleaned = issue.strip().lower()
+            if not cleaned:
+                continue
+            is_placeholder = False
+            for p in no_issue_prefixes:
+                if (
+                    cleaned == p
+                    or cleaned.startswith(p + " ")
+                    or cleaned.startswith(p + ".")
+                    or cleaned.startswith(p + ":")
+                    or cleaned.startswith(p + ",")
+                    or cleaned.startswith(p + " -")
+                ):
+                    is_placeholder = True
+                    break
+            if not is_placeholder:
+                return True
+        return False
+
     def _needs_debugging(self, iteration: WorkflowIteration) -> Optional[str]:
         """Determine whether self-correction is required.
 
@@ -1039,11 +1136,11 @@ class RunWorkflowUseCase:
         if review is not None:
             logic_issues = getattr(review, "logic_issues", None) or []
             security_concerns = getattr(review, "security_concerns", None) or []
-            if logic_issues:
+            if self._has_genuine_issues(logic_issues):
                 feedback_parts.append(
                     "Critical logic issues:\n" + "\n".join(logic_issues)
                 )
-            if security_concerns:
+            if self._has_genuine_issues(security_concerns):
                 feedback_parts.append(
                     "Security concerns:\n" + "\n".join(security_concerns)
                 )
@@ -1084,3 +1181,37 @@ class RunWorkflowUseCase:
             test_error=None,
             iterations=[],
         )
+
+    def _generate_workflow_documentation(
+        self,
+        *,
+        code: str,
+        retrieved_context: Optional[str],
+        final_status: WorkflowStatus,
+    ) -> tuple[Optional[DocumentationReport], Optional[str], WorkflowStatus]:
+        """Generate documentation once at the end of a successful workflow run.
+
+        Best-effort: if documentation generation fails, the workflow does not
+        fail, but status becomes COMPLETED_WITH_WARNINGS and error is recorded.
+        """
+        if self._documentation_use_case is None:
+            return None, None, final_status
+
+        logger.info("Workflow Documentation: generating final documentation")
+        try:
+            doc_result = self._documentation_use_case.execute(
+                GenerateDocumentationRequest(
+                    code=code,
+                    retrieved_context=retrieved_context,
+                )
+            )
+            logger.info("Workflow Documentation: finished successfully")
+            return doc_result.report, None, final_status
+        except Exception as exc:
+            logger.warning("Workflow Documentation: generation failed (non-blocking): %s", exc)
+            new_status = (
+                WorkflowStatus.COMPLETED_WITH_WARNINGS
+                if final_status == WorkflowStatus.COMPLETED
+                else final_status
+            )
+            return None, str(exc), new_status

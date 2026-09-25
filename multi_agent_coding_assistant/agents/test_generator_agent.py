@@ -121,6 +121,36 @@ class TestGeneratorAgent:
             "Never generate arbitrary application code outside the test suite.\n"
             "Your only responsibility is analyzing the source code and "
             "generating a pytest-compatible test suite.\n"
+            "RULES FOR GENERATED TESTS:\n"
+            "1. The code under test is available from the Python module: generated_code\n"
+            "2. Generated tests must explicitly import the required functions/classes "
+            "from generated_code (for example: from generated_code import multiply). "
+            "Do not assume test code shares the same namespace as the application code.\n"
+            "3. Tests must validate the actual public behavior of the generated code.\n"
+            "4. Use pytest where appropriate for test structure and assertions.\n"
+            "5. For floating-point calculations, generated tests MUST avoid strict exact "
+            "equality (==) when numerical precision can vary. Use pytest.approx(expected) "
+            "instead (for example: assert multiply(1e-10, 1e-10) == pytest.approx(1e-20) "
+            "instead of assert multiply(1e-10, 1e-10) == 1e-20).\n"
+            "6. Special Floating-Point Values and NaN Semantics:\n"
+            "   - Follow correct IEEE-754 and Python floating-point semantics.\n"
+            "   - Never compare NaN values using `==` or `!=` as a correctness assertion.\n"
+            "   - Do not write assertions such as `value == float(\"nan\")` or `value == float(\"NaN\")` "
+            "because NaN does not equal itself in Python (float('nan') == float('nan') is always False).\n"
+            "   - When testing whether a result is NaN, import `math` and use `math.isnan(value)`.\n"
+            "   - When testing infinity, use appropriate direct infinity checks (such as `math.isinf(value)` "
+            "or direct comparison with `float('inf')`), but do not confuse infinity with NaN.\n"
+            "7. Avoid Speculative Test Requirements:\n"
+            "   - Primarily test behavior explicitly requested by the user or established by the code contract.\n"
+            "   - Cover reasonable edge cases directly implied by the requirements (such as positive/negative numbers, "
+            "zero, integer/float combinations, reasonable floating-point precision).\n"
+            "   - Avoid inventing unsupported or speculative requirements or behaviors.\n"
+            "   - Do not assume validation or error-handling behavior (e.g. requiring strings, lists, or dicts to raise "
+            "TypeError, or None handling, or NaN/Infinity handling) unless:\n"
+            "     a) the user explicitly requested it,\n"
+            "     b) the plan/specification explicitly requires it, or\n"
+            "     c) the generated code contract clearly establishes it.\n"
+            "   - Do not add large numbers of speculative tests merely to increase coverage.\n"
             "Return ONLY structured test information as valid JSON.\n"
             "The JSON MUST match the following schema:\n"
             "{\n"
@@ -148,8 +178,13 @@ class TestGeneratorAgent:
             "Do not include markdown. Do not include explanations outside JSON."
         )
 
-        user_prompt = "Analyze the following Python code and generate tests:\n\n"
-        user_prompt += "```python\n" + code + "\n```\n"
+        user_prompt = (
+            "Analyze the following Python code and generate tests.\n"
+            "Import the required functions/classes from `generated_code`, use `pytest.approx` "
+            "for floating-point comparisons, use `math.isnan(...)` (never equality ==) when checking NaN, "
+            "and avoid speculative unrequested test requirements:\n\n"
+            "```python\n" + code + "\n```\n"
+        )
 
         logger.info("TestGeneratorAgent: generating tests")
         raw_text = self._call_llm(user_prompt, system_prompt)
@@ -225,7 +260,6 @@ class TestGeneratorAgent:
             "negative_cases",
             "coverage_suggestions",
             "generated_test_code",
-            "final_summary",
         ]
         for field_name in required_fields:
             if field_name not in data:
@@ -297,6 +331,12 @@ class TestGeneratorAgent:
                     "generated_test_code does not appear to be pytest test code"
                 )
 
+        final_summary = as_str(
+            data.get("final_summary")
+            or data.get("test_overview")
+            or ""
+        )
+
         return TestGenerationReport(
             test_overview=as_str(data["test_overview"]),
             test_framework=as_str(data["test_framework"]),
@@ -305,7 +345,7 @@ class TestGeneratorAgent:
             negative_cases=as_test_case_list(data["negative_cases"]),
             coverage_suggestions=as_str_list(data["coverage_suggestions"]),
             generated_test_code=generated_test_code,
-            final_summary=as_str(data["final_summary"]),
+            final_summary=final_summary,
         )
 
 
