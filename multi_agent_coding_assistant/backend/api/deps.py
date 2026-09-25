@@ -14,9 +14,11 @@ from typing import Any
 from agents.coder_agent import CoderAgent
 from agents.code_reviewer_agent import ReviewerAgent
 from agents.debugger_agent import DebuggerAgent
+from agents.documentation_agent import DocumentationAgent
 from agents.test_generator_agent import TestGeneratorAgent
 from backend.application.use_cases import GenerateCodeUseCase
 from backend.application.debugging_use_cases import DebugCodeUseCase
+from backend.application.documentation_use_cases import GenerateDocumentationUseCase
 from backend.application.planning_use_cases import GeneratePlanUseCase
 from config.settings import get_settings
 from backend.application.review_use_cases import ReviewCodeUseCase
@@ -126,6 +128,18 @@ def get_debug_code_use_case() -> DebugCodeUseCase:
 
 
 @lru_cache(maxsize=1)
+def get_documentation_agent() -> DocumentationAgent:
+    return DocumentationAgent(llm_client=_get_llm_client())
+
+
+@lru_cache(maxsize=1)
+def get_generate_documentation_use_case() -> GenerateDocumentationUseCase:
+    return GenerateDocumentationUseCase(
+        documentation_agent=get_documentation_agent()
+    )
+
+
+@lru_cache(maxsize=1)
 def get_test_execution_use_case() -> ExecuteTestsUseCase:
     """Provide the test execution use-case.
 
@@ -153,6 +167,7 @@ def get_run_workflow_use_case() -> RunWorkflowUseCase:
         repository_coder_agent=get_coder_agent(),
         repository_modify_use_case=get_modify_repository_use_case(),
         repository_debugger_agent=get_debugger_agent(),
+        documentation_use_case=get_generate_documentation_use_case(),
         max_iterations=get_settings().max_iterations,
     )
 

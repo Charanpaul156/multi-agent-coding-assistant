@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from agents.documentation_agent import DocumentationReport
 from agents.planner_agent import ImplementationPlan
 from agents.code_reviewer_agent import ReviewReport
 from backend.api.deps import get_run_workflow_use_case
@@ -169,6 +170,74 @@ def test_run_workflow_test_generation_warning() -> None:
     assert wf["generated_tests"] is None
     assert wf["test_execution"] is None
     assert wf["test_error"] == "test generation failed"
+
+    app.dependency_overrides.clear()
+
+
+def _make_doc_report() -> DocumentationReport:
+    return DocumentationReport(
+        summary="Calculator documentation",
+        module_description="Module for basic arithmetic",
+        function_docs=[{"name": "add"}],
+        class_docs=[],
+        usage_examples=["add(1, 2)"],
+        markdown_documentation="# Calculator",
+    )
+
+
+def test_run_workflow_with_documentation() -> None:
+    doc = _make_doc_report()
+    result = _full_result()
+    res_with_doc = WorkflowResult(
+        success=True,
+        workflow_status=WorkflowStatus.COMPLETED,
+        planning=result.planning,
+        generated_code=result.generated_code,
+        generated_tests=result.generated_tests,
+        execution=result.execution,
+        test_execution=result.test_execution,
+        review=result.review,
+        documentation=doc,
+    )
+    use_case = _FakeWorkflowUseCase(result=res_with_doc)
+    app.dependency_overrides[get_run_workflow_use_case] = lambda: use_case
+    client = TestClient(app)
+
+    resp = client.post("/run-workflow", json={"prompt": "build calculator"})
+    assert resp.status_code == 200
+    wf = resp.json()["workflow"]
+    assert wf["documentation"] is not None
+    assert wf["documentation"]["summary"] == "Calculator documentation"
+    assert wf["documentation"]["markdown_documentation"] == "# Calculator"
+    assert wf["documentation_error"] is None
+
+    app.dependency_overrides.clear()
+
+
+def test_run_workflow_with_documentation_error() -> None:
+    result = _full_result()
+    res_with_err = WorkflowResult(
+        success=True,
+        workflow_status=WorkflowStatus.COMPLETED_WITH_WARNINGS,
+        planning=result.planning,
+        generated_code=result.generated_code,
+        generated_tests=result.generated_tests,
+        execution=result.execution,
+        test_execution=result.test_execution,
+        review=result.review,
+        documentation=None,
+        documentation_error="Documentation LLM timeout",
+    )
+    use_case = _FakeWorkflowUseCase(result=res_with_err)
+    app.dependency_overrides[get_run_workflow_use_case] = lambda: use_case
+    client = TestClient(app)
+
+    resp = client.post("/run-workflow", json={"prompt": "build calculator"})
+    assert resp.status_code == 200
+    wf = resp.json()["workflow"]
+    assert wf["documentation"] is None
+    assert wf["documentation_error"] == "Documentation LLM timeout"
+    assert wf["workflow_status"] == "completed_with_warnings"
 
     app.dependency_overrides.clear()
 

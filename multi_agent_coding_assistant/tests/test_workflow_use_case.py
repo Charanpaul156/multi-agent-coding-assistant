@@ -5,7 +5,12 @@ Uses fake/mocked use-cases so no LLM/network is required.
 
 from __future__ import annotations
 
+from agents.documentation_agent import DocumentationReport
 from agents.planner_agent import ImplementationPlan
+from backend.application.documentation_use_cases import (
+    GenerateDocumentationRequest,
+    GenerateDocumentationResult,
+)
 from backend.application.test_generation_use_cases import (
     GenerateTestsResult,
 )
@@ -134,12 +139,39 @@ class FakeReview:
         return _R(self.report)
 
 
+def make_documentation_report() -> DocumentationReport:
+    return DocumentationReport(
+        summary="Calculator documentation",
+        module_description="Module providing math operations",
+        function_docs=[{"name": "add"}],
+        class_docs=[],
+        usage_examples=["add(1, 2)"],
+        markdown_documentation="# Calculator Docs",
+    )
+
+
+class FakeDocumentation:
+    def __init__(self, report=None, exc=None):
+        self.report = report
+        self.exc = exc
+        self.calls = 0
+        self.last_request = None
+
+    def execute(self, request: GenerateDocumentationRequest) -> GenerateDocumentationResult:
+        self.calls += 1
+        self.last_request = request
+        if self.exc is not None:
+            raise self.exc
+        return GenerateDocumentationResult(report=self.report)
+
+
 def build_workflow(
     *,
     test_gen_exc=None,
     execute_exc=None,
     test_exc=None,
     review_exc=None,
+    doc_use_case=None,
 ):
     return RunWorkflowUseCase(
         plan_use_case=FakePlan(plan=make_plan()),
@@ -164,6 +196,7 @@ def build_workflow(
             report=None if review_exc else object(),
             exc=review_exc,
         ),
+        documentation_use_case=doc_use_case,
     )
 
 
@@ -267,3 +300,142 @@ def test_workflow_status_values() -> None:
     assert WorkflowStatus.COMPLETED_WITH_WARNINGS.value == "completed_with_warnings"
     assert WorkflowStatus.PLANNING_FAILED.value == "planning_failed"
     assert WorkflowStatus.CODING_FAILED.value == "coding_failed"
+
+
+def test_workflow_generates_documentation_on_success() -> None:
+    doc_report = make_documentation_report()
+    doc_use_case = FakeDocumentation(report=doc_report)
+    run = build_workflow(doc_use_case=doc_use_case)
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert result.documentation is doc_report
+    assert result.documentation_error is None
+    assert doc_use_case.calls == 1
+    assert doc_use_case.last_request is not None
+    assert doc_use_case.last_request.code == result.generated_code
+    assert doc_use_case.last_request.retrieved_context is None
+
+
+def test_workflow_documentation_failure_is_non_blocking() -> None:
+    doc_use_case = FakeDocumentation(exc=RuntimeError("Documentation LLM timeout"))
+    run = build_workflow(doc_use_case=doc_use_case)
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED_WITH_WARNINGS
+    assert result.documentation is None
+    assert result.documentation_error == "Documentation LLM timeout"
+    assert doc_use_case.calls == 1
+    assert result.generated_code is not None
+
+
+def test_workflow_without_documentation_use_case() -> None:
+    run = build_workflow(doc_use_case=None)
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert result.workflow_status == WorkflowStatus.COMPLETED
+    assert result.documentation is None
+    assert result.documentation_error is None
+
+
+def test_workflow_fatal_planning_does_not_call_documentation() -> None:
+    doc_use_case = FakeDocumentation(report=make_documentation_report())
+    run = RunWorkflowUseCase(
+        plan_use_case=FakePlan(exc=RuntimeError("planner failed")),
+        coder_use_case=FakeCode(code="pass"),
+        test_generation_use_case=FakeTestGeneration(),
+        execute_use_case=FakeExecute(),
+        test_execution_use_case=FakeTestExecute(),
+        review_use_case=FakeReview(),
+        documentation_use_case=doc_use_case,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is False
+    assert result.workflow_status == WorkflowStatus.PLANNING_FAILED
+    assert result.documentation is None
+    assert doc_use_case.calls == 0
+
+
+def test_workflow_fatal_coding_does_not_call_documentation() -> None:
+    doc_use_case = FakeDocumentation(report=make_documentation_report())
+    run = RunWorkflowUseCase(
+        plan_use_case=FakePlan(plan=make_plan()),
+        coder_use_case=FakeCode(exc=RuntimeError("coder failed")),
+        test_generation_use_case=FakeTestGeneration(),
+        execute_use_case=FakeExecute(),
+        test_execution_use_case=FakeTestExecute(),
+        review_use_case=FakeReview(),
+        documentation_use_case=doc_use_case,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is False
+    assert result.workflow_status == WorkflowStatus.CODING_FAILED
+    assert result.documentation is None
+    assert doc_use_case.calls == 0
+
+
+def test_workflow_documentation_called_only_once_with_self_correction() -> None:
+    from backend.application.debugging_use_cases import DebugCodeResult
+    from agents.debugger_agent import DebugReport
+
+    class FakeDebugUseCase:
+        def __init__(self, corrected_code: str):
+            self.corrected_code = corrected_code
+            self.calls = 0
+
+        def execute(self, request):
+            self.calls += 1
+            return DebugCodeResult(
+                report=DebugReport(
+                    issue_detected=True,
+                    error_type="Fix",
+                    root_cause="Bug",
+                    affected_component="calc",
+                    explanation="Fix bug",
+                    suggested_changes=[],
+                    corrected_code=self.corrected_code,
+                    confidence=1.0,
+                    final_summary="Fixed",
+                )
+            )
+
+    class MultiExecute:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                return ExecutionResponse(False, "", "error", 1.0, 1)
+            return ExecutionResponse(True, "ok", "", 1.0, 0)
+
+    doc_report = make_documentation_report()
+    doc_use_case = FakeDocumentation(report=doc_report)
+    debugger = FakeDebugUseCase(corrected_code="def add(a, b): return a + b # fixed")
+
+    run = RunWorkflowUseCase(
+        plan_use_case=FakePlan(plan=make_plan()),
+        coder_use_case=FakeCode(code="def add(a, b): broken"),
+        test_generation_use_case=FakeTestGeneration(report=make_test_report()),
+        execute_use_case=MultiExecute(),
+        test_execution_use_case=FakeTestExecute(
+            resp=TestExecutionResponse(True, "1 passed", "", 1.0, 0, 1, 0)
+        ),
+        review_use_case=FakeReview(report=object()),
+        debug_use_case=debugger,
+        documentation_use_case=doc_use_case,
+        max_iterations=2,
+    )
+    result = run.execute(WorkflowRequest(prompt="build calculator"))
+
+    assert result.success is True
+    assert len(result.iterations) == 2
+    assert doc_use_case.calls == 1
+    assert doc_use_case.last_request is not None
+    assert doc_use_case.last_request.code == "def add(a, b): return a + b # fixed"
+    assert result.documentation is doc_report

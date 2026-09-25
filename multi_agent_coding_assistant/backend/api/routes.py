@@ -7,6 +7,7 @@ Business logic must remain in the application layer.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -16,6 +17,7 @@ from backend.api.deps import (
     get_coder_agent,
     get_execute_code_use_case,
     get_generate_code_use_case,
+    get_generate_documentation_use_case,
     get_generate_plan_use_case,
     get_generate_tests_use_case,
     get_index_repository_use_case,
@@ -29,6 +31,10 @@ from backend.application.use_cases import GenerateCodeRequest, GenerateCodeUseCa
 from backend.application.debugging_use_cases import (
     DebugCodeRequest,
     DebugCodeUseCase,
+)
+from backend.application.documentation_use_cases import (
+    GenerateDocumentationRequest,
+    GenerateDocumentationUseCase,
 )
 from backend.application.planning_use_cases import GeneratePlanRequest, GeneratePlanUseCase
 from backend.application.review_use_cases import ReviewCodeRequest, ReviewCodeUseCase
@@ -507,6 +513,78 @@ def generate_tests(
         raise HTTPException(status_code=500, detail="LLM test generation failed") from exc
 
 
+class GenerateDocumentationPayload(BaseModel):
+    code: str = Field(..., min_length=1)
+    retrieved_context: str | None = None
+
+
+class DocumentationReportModel(BaseModel):
+    summary: str
+    module_description: str
+    function_docs: list[Any] | dict[str, Any]
+    class_docs: list[Any] | dict[str, Any]
+    usage_examples: list[Any]
+    markdown_documentation: str
+
+
+class GenerateDocumentationApiResponse(BaseModel):
+    success: bool
+    report: DocumentationReportModel
+
+
+@router.post(
+    "/generate-documentation",
+    response_model=GenerateDocumentationApiResponse,
+    tags=["ai"],
+)
+def generate_documentation(
+    payload: GenerateDocumentationPayload,
+    use_case: GenerateDocumentationUseCase = Depends(
+        get_generate_documentation_use_case
+    ),
+) -> GenerateDocumentationApiResponse:
+    """Generate structured documentation for Python code using AI."""
+
+    code = (payload.code or "").strip()
+    if not code:
+        logger.warning("POST /generate-documentation: empty code")
+        raise HTTPException(status_code=400, detail="code must not be empty")
+
+    logger.info("POST /generate-documentation: request received")
+    try:
+        logger.info("POST /generate-documentation: use-case started")
+        result = use_case.execute(
+            GenerateDocumentationRequest(
+                code=code,
+                retrieved_context=payload.retrieved_context,
+            )
+        )
+        logger.info("POST /generate-documentation: use-case finished")
+
+        report = result.report
+        return GenerateDocumentationApiResponse(
+            success=True,
+            report=DocumentationReportModel(
+                summary=report.summary,
+                module_description=report.module_description,
+                function_docs=report.function_docs,
+                class_docs=report.class_docs,
+                usage_examples=report.usage_examples,
+                markdown_documentation=report.markdown_documentation,
+            ),
+        )
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "POST /generate-documentation: validation error: %s", exc
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("POST /generate-documentation: error")
+        raise HTTPException(
+            status_code=500, detail="LLM documentation generation failed"
+        ) from exc
+
+
 class RunWorkflowPayload(BaseModel):
     prompt: str = Field(..., min_length=1)
     repository_root: str | None = None
@@ -567,6 +645,8 @@ class WorkflowResponseModel(BaseModel):
     error: str | None = None
     test_error: str | None = None
     iterations: list[WorkflowIterationModel] = []
+    documentation: DocumentationReportModel | None = None
+    documentation_error: str | None = None
 
 
 class RunWorkflowApiResponse(BaseModel):
@@ -733,6 +813,18 @@ def run_workflow(
                 )
             )
 
+        documentation_model = None
+        if result.documentation is not None:
+            doc = result.documentation
+            documentation_model = DocumentationReportModel(
+                summary=doc.summary,
+                module_description=doc.module_description,
+                function_docs=doc.function_docs,
+                class_docs=doc.class_docs,
+                usage_examples=doc.usage_examples,
+                markdown_documentation=doc.markdown_documentation,
+            )
+
         return RunWorkflowApiResponse(
             success=result.success,
             workflow=WorkflowResponseModel(
@@ -747,6 +839,8 @@ def run_workflow(
                 error=result.error,
                 test_error=result.test_error,
                 iterations=iteration_models,
+                documentation=documentation_model,
+                documentation_error=result.documentation_error,
             ),
         )
     except ValueError as exc:
