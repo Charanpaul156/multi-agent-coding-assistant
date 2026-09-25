@@ -5,6 +5,7 @@ Uses monkeypatched ``subprocess.run`` so no real pytest is required.
 
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -254,3 +255,97 @@ def test_path_traversal_prevention(monkeypatch) -> None:
                 files={"../../etc/passwd": "malicious content"},
             )
         )
+
+
+def test_standalone_fallback_import_injected_and_executes_real_pytest() -> None:
+    """Verify fallback import allows standalone tests to execute without NameError."""
+    executor = TestExecutor(timeout_seconds=10.0)
+    resp = executor.execute(
+        TestExecutionRequest(
+            generated_code="def multiply(a, b):\n    return a * b\n",
+            generated_tests="def test_multiply():\n    assert multiply(2, 3) == 6\n",
+        )
+    )
+
+    assert resp.success is True
+    assert resp.exit_code == 0
+    assert resp.passed == 1
+
+
+def test_standalone_fallback_import_injected_content(monkeypatch) -> None:
+    """Verify fallback import is prepended to test_generated.py when import is missing."""
+    written_test_content = None
+
+    def fake_run(args, **kwargs):
+        nonlocal written_test_content
+        test_file = Path(kwargs["cwd"]) / "test_generated.py"
+        written_test_content = test_file.read_text(encoding="utf-8")
+        return _FakeCompleted(stdout="1 passed", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = TestExecutor(timeout_seconds=10.0)
+    resp = executor.execute(
+        TestExecutionRequest(
+            generated_code="def multiply(a, b):\n    return a * b\n",
+            generated_tests="def test_multiply():\n    assert multiply(2, 3) == 6\n",
+        )
+    )
+
+    assert resp.success is True
+    assert written_test_content is not None
+    assert "from generated_code import *" in written_test_content
+    assert "def test_multiply():" in written_test_content
+
+
+def test_standalone_no_duplicate_import_when_already_imported(monkeypatch) -> None:
+    """Verify TestExecutor does NOT add duplicate fallback import if already present."""
+    written_test_content = None
+
+    def fake_run(args, **kwargs):
+        nonlocal written_test_content
+        test_file = Path(kwargs["cwd"]) / "test_generated.py"
+        written_test_content = test_file.read_text(encoding="utf-8")
+        return _FakeCompleted(stdout="1 passed", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = TestExecutor(timeout_seconds=10.0)
+    resp = executor.execute(
+        TestExecutionRequest(
+            generated_code="def multiply(a, b):\n    return a * b\n",
+            generated_tests=(
+                "from generated_code import multiply\n\n"
+                "def test_multiply():\n"
+                "    assert multiply(2, 3) == 6\n"
+            ),
+        )
+    )
+
+    assert resp.success is True
+    assert written_test_content is not None
+    assert "from generated_code import *" not in written_test_content
+    assert written_test_content.count("generated_code") == 1
+
+
+def test_multi_file_does_not_inject_generated_code_fallback(monkeypatch) -> None:
+    """Verify multi-file execution behavior remains unchanged without injecting fallback."""
+    written_test_content = None
+
+    def fake_run(args, **kwargs):
+        nonlocal written_test_content
+        test_file = Path(kwargs["cwd"]) / "test_generated.py"
+        written_test_content = test_file.read_text(encoding="utf-8")
+        return _FakeCompleted(stdout="1 passed", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = TestExecutor(timeout_seconds=10.0)
+    resp = executor.execute(
+        TestExecutionRequest(
+            generated_tests="def test_something():\n    assert True\n",
+            files={"calc.py": "def multiply(a, b): return a * b\n"},
+        )
+    )
+
+    assert resp.success is True
+    assert written_test_content is not None
+    assert "from generated_code import *" not in written_test_content
+

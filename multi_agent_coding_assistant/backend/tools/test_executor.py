@@ -148,6 +148,7 @@ class TestExecutor:
                     files_to_write[rel_path] = content
 
             # 2. Parse embedded sections from generated_code if files not explicitly provided.
+            parsed_sections: dict[str, str] = {}
             if not request.files and has_code:
                 parsed_sections = self._parse_code_sections(request.generated_code)
                 if parsed_sections:
@@ -169,8 +170,15 @@ class TestExecutor:
             for rel_path, content in files_to_write.items():
                 self._safe_write_file(tmp_dir, rel_path, content)
 
+            test_content = request.generated_tests
+            # Standalone generated-code execution: if generated_code.py is the application module
+            # and the test suite does not import it, prepend a safe fallback import.
+            is_standalone = (not request.files) and (not parsed_sections) and has_code
+            if is_standalone and not self._has_generated_code_import(test_content):
+                test_content = self._inject_generated_code_fallback(test_content)
+
             test_file = tmp_dir / "test_generated.py"
-            test_file.write_text(request.generated_tests, encoding="utf-8")
+            test_file.write_text(test_content, encoding="utf-8")
 
             logger.info("TestExecutor: running pytest in %s", tmp_dir)
             completed = subprocess.run(
@@ -313,6 +321,61 @@ class TestExecutor:
         stdlib_names = getattr(sys, "stdlib_module_names", set())
         excluded = stdlib_names | {"pytest", "unittest", "conftest"}
         return [m for m in modules if m not in excluded]
+
+    @staticmethod
+    def _has_generated_code_import(test_code: str) -> bool:
+        """Check if test code imports or references the generated_code module."""
+        try:
+            tree = ast.parse(test_code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top_mod = alias.name.split(".")[0]
+                        if top_mod == "generated_code":
+                            return True
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module and node.module.split(".")[0] == "generated_code":
+                        return True
+        except Exception:
+            if re.search(
+                r"^\s*(?:from\s+generated_code(?:\.|\s)|import\s+generated_code(?:\.|\s|,|$))",
+                test_code,
+                re.MULTILINE,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _inject_generated_code_fallback(test_code: str) -> str:
+        """Prepend 'from generated_code import *' safely respecting __future__ imports."""
+        import_stmt = "from generated_code import *\n"
+        try:
+            tree = ast.parse(test_code)
+            last_future_lineno = 0
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                    end_line = getattr(node, "end_lineno", None) or node.lineno
+                    last_future_lineno = max(last_future_lineno, end_line)
+                elif isinstance(node, ast.Expr) and isinstance(
+                    getattr(node, "value", None), ast.Constant
+                ) and isinstance(node.value.value, str):
+                    # Module docstring
+                    pass
+                else:
+                    break
+
+            if last_future_lineno > 0:
+                lines = test_code.splitlines(keepends=True)
+                return (
+                    "".join(lines[:last_future_lineno])
+                    + "\n"
+                    + import_stmt
+                    + "".join(lines[last_future_lineno:])
+                )
+        except Exception:
+            pass
+
+        return import_stmt + "\n" + test_code
 
     @staticmethod
     def _parse_counts(stdout: str) -> tuple[Optional[int], Optional[int]]:
