@@ -19,6 +19,7 @@ from backend.domain.change_models import (
     DiffEntry,
     FileChange,
     ValidationReport,
+    ApprovalStatus,
 )
 
 
@@ -107,11 +108,13 @@ class FactorySpy:
         return self.instance
 
 
-def _request(repo_root: str, *, dry_run: bool = False) -> ModifyRepositoryRequest:
+def _request(repo_root: str, *, dry_run: bool = False, approval: ApprovalStatus | None = None) -> ModifyRepositoryRequest:
+    appr = approval if approval is not None else (ApprovalStatus.PREVIEW if dry_run else ApprovalStatus.APPROVED)
     return ModifyRepositoryRequest(
         repository_root=repo_root,
         change_set=_change_set(),
         dry_run=dry_run,
+        approval=appr,
     )
 
 

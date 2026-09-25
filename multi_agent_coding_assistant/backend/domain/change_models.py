@@ -25,6 +25,15 @@ class ChangeOperation(str, Enum):
     MODIFY = "modify"
 
 
+class ApprovalStatus(str, Enum):
+    """Approval lifecycle status for proposed repository changes."""
+
+    PREVIEW = "preview"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+
+
 @dataclass(frozen=True)
 class FileChange:
     """A single proposed file change.

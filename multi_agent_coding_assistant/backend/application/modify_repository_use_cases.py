@@ -32,12 +32,14 @@ from typing import Optional
 
 from backend.domain.change_models import (
     ApplicationResult,
+    ApprovalStatus,
     ChangeOperation,
     ChangeSet,
     DiffEntry,
     FileChange,
     ValidationReport,
 )
+from backend.infrastructure.approval_store import ApprovalStore
 from backend.infrastructure.change_applier import ChangeApplier
 from backend.infrastructure.change_validation import ChangeValidator
 from backend.infrastructure.diff_generator import diff_for_change
@@ -82,6 +84,7 @@ class ModifyRepositoryStatus(str, Enum):
     REVIEW_FAILED = "review_failed"
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     DEBUGGER_FAILED = "debugger_failed"
+    REJECTED = "rejected"          # user explicitly rejected proposed changes
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,8 @@ class ModifyRepositoryRequest:
     max_iterations: int = 3
     change_set: Optional[ChangeSet] = None
     repository_root: Optional[str] = None
+    approval: ApprovalStatus = ApprovalStatus.PREVIEW
+    approval_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +128,8 @@ class ModifyRepositoryResult:
     status: ModifyRepositoryStatus
     repository_path: str
     dry_run: bool
+    approval_status: ApprovalStatus = ApprovalStatus.PREVIEW
+    approval_token: Optional[str] = None
     planning: Optional[ImplementationPlan] = None
     change_set: Optional[ChangeSet] = None
     validation: Optional[ValidationReport] = None
@@ -170,6 +177,7 @@ class ModifyRepositoryUseCase:
         test_execution_use_case: Optional[ExecuteTestsUseCase] = None,
         review_use_case: Optional[ReviewCodeUseCase] = None,
         debugger_agent: Optional[DebuggerAgent] = None,
+        approval_store: Optional[ApprovalStore] = None,
         max_iterations: int = 3,
     ) -> None:
         self._config = config
@@ -182,11 +190,34 @@ class ModifyRepositoryUseCase:
         self._test_execution_use_case = test_execution_use_case
         self._review_use_case = review_use_case
         self._debugger_agent = debugger_agent
+        self._approval_store = approval_store
         self._max_iterations = max(1, int(max_iterations))
 
     # ------------------------------------------------------------------ #
     # Public entry point
     # ------------------------------------------------------------------ #
+
+    def approve(self, token: str, repository_path: str = "") -> ModifyRepositoryResult:
+        """Approve and apply an existing proposed change ticket."""
+        return self.execute(
+            ModifyRepositoryRequest(
+                repository_path=repository_path,
+                approval_token=token,
+                approval=ApprovalStatus.APPROVED,
+                dry_run=False,
+            )
+        )
+
+    def reject(self, token: str, repository_path: str = "") -> ModifyRepositoryResult:
+        """Reject an existing proposed change ticket."""
+        return self.execute(
+            ModifyRepositoryRequest(
+                repository_path=repository_path,
+                approval_token=token,
+                approval=ApprovalStatus.REJECTED,
+                dry_run=True,
+            )
+        )
 
     def execute(self, request: ModifyRepositoryRequest) -> ModifyRepositoryResult:
         """Run the repository-modification workflow."""
@@ -195,10 +226,15 @@ class ModifyRepositoryUseCase:
         repo_path = request.repository_path or request.repository_root or ""
 
         logger.info(
-            "ModifyRepositoryUseCase: start repo=%r dry_run=%r",
+            "ModifyRepositoryUseCase: start repo=%r dry_run=%r approval=%r",
             repo_path,
             request.dry_run,
+            request.approval,
         )
+
+        # If an approval_token is supplied, handle the ticket approval/rejection:
+        if request.approval_token:
+            return self._handle_approval_token(request, repo_path)
 
         # If a pre-generated change_set is passed directly:
         if request.change_set is not None:
@@ -210,6 +246,7 @@ class ModifyRepositoryUseCase:
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.VALIDATION_FAILED,
+                    approval_status=request.approval,
                     repository_path=repo_path,
                     dry_run=request.dry_run,
                     change_set=change_set,
@@ -218,15 +255,65 @@ class ModifyRepositoryUseCase:
                     error="proposed changes failed validation",
                 )
 
+            token = None
+            if self._approval_store is not None:
+                ticket = self._approval_store.create_ticket(
+                    repository_path=repo_path,
+                    change_set=change_set,
+                    validation=validation,
+                    diffs=diffs,
+                )
+                token = ticket.token
+
             if request.dry_run:
                 return ModifyRepositoryResult(
                     success=True,
                     status=ModifyRepositoryStatus.PROPOSED,
+                    approval_status=ApprovalStatus.PREVIEW,
+                    approval_token=token,
                     repository_path=repo_path,
                     dry_run=True,
                     change_set=change_set,
                     validation=validation,
                     diffs=diffs,
+                )
+
+            # Enforce approval == APPROVED before calling ChangeApplier
+            if request.approval != ApprovalStatus.APPROVED:
+                return ModifyRepositoryResult(
+                    success=False,
+                    status=(
+                        ModifyRepositoryStatus.REJECTED
+                        if request.approval == ApprovalStatus.REJECTED
+                        else ModifyRepositoryStatus.PROPOSED
+                    ),
+                    approval_status=request.approval,
+                    approval_token=token,
+                    repository_path=repo_path,
+                    dry_run=request.dry_run,
+                    change_set=change_set,
+                    validation=validation,
+                    diffs=diffs,
+                    error=(
+                        "ChangeSet was rejected by user"
+                        if request.approval == ApprovalStatus.REJECTED
+                        else "Explicit approval required before applying repository changes"
+                    ),
+                )
+
+            stale_error = self._check_stale(change_set, repository_path=repo_path)
+            if stale_error:
+                return ModifyRepositoryResult(
+                    success=False,
+                    status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                    approval_status=ApprovalStatus.REJECTED,
+                    approval_token=token,
+                    repository_path=repo_path,
+                    dry_run=request.dry_run,
+                    change_set=change_set,
+                    validation=validation,
+                    diffs=diffs,
+                    error=stale_error,
                 )
 
             application = self._apply(change_set)
@@ -235,9 +322,14 @@ class ModifyRepositoryUseCase:
                 if application.success
                 else ModifyRepositoryStatus.APPLICATION_FAILED
             )
+            if application.success and token and self._approval_store:
+                self._approval_store.update_status(token, ApprovalStatus.APPLIED)
+
             return ModifyRepositoryResult(
                 success=application.success,
                 status=status,
+                approval_status=ApprovalStatus.APPLIED if application.success else ApprovalStatus.APPROVED,
+                approval_token=token,
                 repository_path=repo_path,
                 dry_run=False,
                 change_set=change_set,
@@ -265,6 +357,7 @@ class ModifyRepositoryUseCase:
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.VALIDATION_FAILED,
+                approval_status=request.approval,
                 repository_path=request.repository_path,
                 dry_run=request.dry_run,
                 planning=planning,
@@ -280,6 +373,7 @@ class ModifyRepositoryUseCase:
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.VALIDATION_FAILED,
+                approval_status=request.approval,
                 repository_path=request.repository_path,
                 dry_run=request.dry_run,
                 planning=planning,
@@ -291,11 +385,23 @@ class ModifyRepositoryUseCase:
 
         diffs = self._build_diffs(change_set)
 
+        token = None
+        if self._approval_store is not None:
+            ticket = self._approval_store.create_ticket(
+                repository_path=repo_path,
+                change_set=change_set,
+                validation=validation,
+                diffs=diffs,
+            )
+            token = ticket.token
+
         # --- Dry-run: do not write -------------------------------------
         if request.dry_run:
             return ModifyRepositoryResult(
                 success=True,
                 status=ModifyRepositoryStatus.PROPOSED,
+                approval_status=ApprovalStatus.PREVIEW,
+                approval_token=token,
                 repository_path=request.repository_path,
                 dry_run=True,
                 planning=planning,
@@ -304,14 +410,57 @@ class ModifyRepositoryUseCase:
                 diffs=diffs,
             )
 
+        # Enforce approval == APPROVED before calling ChangeApplier
+        if request.approval != ApprovalStatus.APPROVED:
+            return ModifyRepositoryResult(
+                success=False,
+                status=(
+                    ModifyRepositoryStatus.REJECTED
+                    if request.approval == ApprovalStatus.REJECTED
+                    else ModifyRepositoryStatus.PROPOSED
+                ),
+                approval_status=request.approval,
+                approval_token=token,
+                repository_path=request.repository_path,
+                dry_run=request.dry_run,
+                planning=planning,
+                change_set=change_set,
+                validation=validation,
+                diffs=diffs,
+                error=(
+                    "ChangeSet was rejected by user"
+                    if request.approval == ApprovalStatus.REJECTED
+                    else "Explicit approval required before applying repository changes"
+                ),
+            )
+
+        stale_error = self._check_stale(change_set, repository_path=request.repository_path)
+        if stale_error:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=token,
+                repository_path=request.repository_path,
+                dry_run=request.dry_run,
+                planning=planning,
+                change_set=change_set,
+                validation=validation,
+                diffs=diffs,
+                error=stale_error,
+            )
+
         # --- Stage 5+: Apply + validate + self-correct -----------------
-        return self._apply_and_validate(
+        result = self._apply_and_validate(
             request,
             planning,
             change_set,
             validation,
             diffs,
         )
+        if result.success and token and self._approval_store:
+            self._approval_store.update_status(token, ApprovalStatus.APPLIED)
+        return result
 
     # ------------------------------------------------------------------ #
     # Stages
@@ -463,6 +612,177 @@ class ModifyRepositoryUseCase:
             iteration_number += 1
 
     # ------------------------------------------------------------------ #
+    # Approval & Stale Checking
+    # ------------------------------------------------------------------ #
+
+    def _handle_approval_token(
+        self, request: ModifyRepositoryRequest, repo_path: str
+    ) -> ModifyRepositoryResult:
+        """Process an approval or rejection for an existing proposed change ticket."""
+        if self._approval_store is None:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=request.approval_token,
+                repository_path=repo_path,
+                dry_run=request.dry_run,
+                error="Approval store is not configured",
+            )
+
+        ticket = self._approval_store.get_ticket(request.approval_token)
+        if ticket is None:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=request.approval_token,
+                repository_path=repo_path,
+                dry_run=request.dry_run,
+                error=f"Invalid or expired approval token: {request.approval_token}",
+            )
+
+        # Check repository path consistency
+        target_repo = repo_path or ticket.repository_path
+        if repo_path and ticket.repository_path:
+            try:
+                if Path(repo_path).expanduser().resolve() != Path(ticket.repository_path).expanduser().resolve():
+                    return ModifyRepositoryResult(
+                        success=False,
+                        status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                        approval_status=ApprovalStatus.REJECTED,
+                        approval_token=request.approval_token,
+                        repository_path=repo_path,
+                        dry_run=request.dry_run,
+                        error="Approval token does not match repository path",
+                    )
+            except Exception:
+                pass
+
+        # Handle rejection
+        if request.approval == ApprovalStatus.REJECTED or ticket.status == ApprovalStatus.REJECTED:
+            self._approval_store.update_status(ticket.token, ApprovalStatus.REJECTED)
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.REJECTED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=request.approval_token,
+                repository_path=target_repo,
+                dry_run=request.dry_run,
+                change_set=ticket.change_set,
+                validation=ticket.validation,
+                diffs=ticket.diffs,
+                error="ChangeSet was rejected by user",
+            )
+
+        # Prevent re-applying already-applied changes
+        if ticket.status == ApprovalStatus.APPLIED:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                approval_status=ApprovalStatus.APPLIED,
+                approval_token=request.approval_token,
+                repository_path=target_repo,
+                dry_run=request.dry_run,
+                change_set=ticket.change_set,
+                validation=ticket.validation,
+                diffs=ticket.diffs,
+                error="ChangeSet has already been applied",
+            )
+
+        # Enforce approval == APPROVED before calling ChangeApplier
+        if request.approval != ApprovalStatus.APPROVED:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.PROPOSED,
+                approval_status=request.approval,
+                approval_token=request.approval_token,
+                repository_path=target_repo,
+                dry_run=request.dry_run,
+                change_set=ticket.change_set,
+                validation=ticket.validation,
+                diffs=ticket.diffs,
+                error="Explicit approval required before applying repository changes",
+            )
+
+        # Check for stale repository state
+        stale_error = self._check_stale(ticket.change_set, repository_path=target_repo)
+        if stale_error:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.APPLICATION_FAILED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=request.approval_token,
+                repository_path=target_repo,
+                dry_run=request.dry_run,
+                change_set=ticket.change_set,
+                validation=ticket.validation,
+                diffs=ticket.diffs,
+                error=stale_error,
+            )
+
+        # Re-verify validation
+        if not ticket.validation.valid:
+            return ModifyRepositoryResult(
+                success=False,
+                status=ModifyRepositoryStatus.VALIDATION_FAILED,
+                approval_status=ApprovalStatus.REJECTED,
+                approval_token=request.approval_token,
+                repository_path=target_repo,
+                dry_run=request.dry_run,
+                change_set=ticket.change_set,
+                validation=ticket.validation,
+                diffs=ticket.diffs,
+                error="proposed changes failed validation",
+            )
+
+        # Apply approved ChangeSet via ChangeApplier
+        application = self._apply(ticket.change_set)
+        status = (
+            ModifyRepositoryStatus.APPLIED
+            if application.success
+            else ModifyRepositoryStatus.APPLICATION_FAILED
+        )
+        if application.success:
+            self._approval_store.update_status(ticket.token, ApprovalStatus.APPLIED)
+
+        return ModifyRepositoryResult(
+            success=application.success,
+            status=status,
+            approval_status=ApprovalStatus.APPLIED if application.success else ApprovalStatus.APPROVED,
+            approval_token=ticket.token,
+            repository_path=target_repo,
+            dry_run=False,
+            change_set=ticket.change_set,
+            validation=ticket.validation,
+            diffs=ticket.diffs,
+            application=application,
+            error=application.error,
+        )
+
+    def _check_stale(
+        self, change_set: ChangeSet, repository_path: str = ""
+    ) -> Optional[str]:
+        """Verify on-disk state has not changed since the preview was generated."""
+        for change in change_set.changes:
+            if change.operation == ChangeOperation.MODIFY and change.original_hash:
+                _, current_hash = self._read_current(
+                    change.file_path, repository_path=repository_path
+                )
+                if current_hash != change.original_hash:
+                    return (
+                        f"stale ChangeSet: file {change.file_path} changed on disk "
+                        f"(expected hash {change.original_hash[:8]}, found {current_hash[:8]})"
+                    )
+            elif change.operation == ChangeOperation.CREATE:
+                content, _ = self._read_current(
+                    change.file_path, repository_path=repository_path
+                )
+                if content:
+                    return f"stale ChangeSet: target file {change.file_path} already exists on disk"
+        return None
+
+    # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
 
@@ -474,7 +794,10 @@ class ModifyRepositoryUseCase:
         if not repo_path or not isinstance(repo_path, str) or not repo_path.strip():
             raise ValueError("repository_path must be a non-empty string")
 
-        if request.change_set is None:
+        if request.approval_token:
+            if not isinstance(request.approval_token, str) or not request.approval_token.strip():
+                raise ValueError("approval_token must be a non-empty string")
+        elif request.change_set is None:
             if not isinstance(request.request, str) or not request.request.strip():
                 raise ValueError("request must be a non-empty string")
 

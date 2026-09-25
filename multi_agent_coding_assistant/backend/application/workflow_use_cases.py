@@ -44,6 +44,7 @@ from backend.application.review_use_cases import (
     ReviewCodeResult,
     ReviewCodeUseCase,
 )
+from backend.domain.change_models import ApprovalStatus
 from backend.application.modify_repository_use_cases import (
     ModifyRepositoryRequest,
     ModifyRepositoryResult,
@@ -512,6 +513,7 @@ class RunWorkflowUseCase:
                 repository_root=repository_root,
                 change_set=change_set,
                 dry_run=True,
+                approval=ApprovalStatus.PREVIEW,
             )
         )
         initial_proposal = proposal
@@ -574,6 +576,7 @@ class RunWorkflowUseCase:
                 repository_root=repository_root,
                 change_set=change_set,
                 dry_run=False,
+                approval=ApprovalStatus.APPROVED,
             )
         )
         if not application.success:
@@ -670,6 +673,7 @@ class RunWorkflowUseCase:
                     repository_root=repository_root,
                     change_set=corrected,
                     dry_run=True,
+                    approval=ApprovalStatus.PREVIEW,
                 )
             )
             if not proposal.success:
@@ -707,6 +711,7 @@ class RunWorkflowUseCase:
                     repository_root=repository_root,
                     change_set=corrected,
                     dry_run=False,
+                    approval=ApprovalStatus.APPROVED,
                 )
             )
             if not application.success:

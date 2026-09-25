@@ -570,15 +570,27 @@ def _render_modify_repository_result(result: dict | None) -> None:
     if not result:
         return
 
+    approval_status = result.get(
+        "approval_status",
+        "preview" if result.get("dry_run", True) else "applied",
+    )
+    st.write(f"Approval status: **{str(approval_status).upper()}**")
     st.write(
         "Application status: "
         + (
-            "proposal generated"
+            "proposal generated (preview)"
             if result.get("dry_run", True)
             else ("applied" if result.get("success", False) else "failed")
         )
     )
     st.write(f"Dry run: {result.get('dry_run', False)}")
+
+    if approval_status == "preview":
+        st.info("⚠️ Changes are in PREVIEW mode. NO repository files have been written. Explicit approval is required.")
+    elif approval_status == "rejected":
+        st.warning("❌ Proposal was rejected. No files were written to the repository.")
+    elif approval_status in ("approved", "applied"):
+        st.success("✅ Changes have been applied to the repository.")
 
     if result.get("error"):
         st.error(result.get("error"))
@@ -615,7 +627,7 @@ def _render_modify_repository_result(result: dict | None) -> None:
 
     diff_entries = result.get("diff", []) or []
     if diff_entries:
-        st.subheader("Unified Diff")
+        st.subheader("Diff Preview")
         for entry in diff_entries:
             with st.expander(
                 f"{entry.get('operation', '')}: {entry.get('file_path', '')}",
@@ -630,7 +642,7 @@ def _render_modify_repository_result(result: dict | None) -> None:
     st.subheader("Application Status")
     if result.get("success", False):
         if result.get("dry_run", True):
-            st.info("Dry-run completed successfully. No files were modified.")
+            st.info("Dry-run preview completed successfully. Repository files remain untouched.")
         else:
             st.success("Changes applied successfully.")
     else:
@@ -645,40 +657,71 @@ def _render_modify_repository_result(result: dict | None) -> None:
 _render_modify_repository_result(st.session_state.modify_repository_result)
 
 st.markdown("---")
-st.markdown("### Apply Changes")
+st.markdown("### Human Approval Gate")
 st.caption(
-    "This action is explicit. It re-runs the repository-modification pipeline "
-    "with dry_run disabled and apply enabled."
+    "Repository modifications require explicit human approval. "
+    "NO repository files are written until approved."
 )
 
-if st.button("Apply Changes"):
-    proposal = st.session_state.modify_repository_proposal
-    if not proposal:
-        st.error("Generate changes first before applying them.")
-    else:
-        try:
-            with st.spinner("Applying validated changes..."):
-                resp = requests.post(
-                    f"{BACKEND_URL}/modify-repository",
-                    json={
-                        "repository": proposal["repository"],
-                        "request": proposal["request"],
-                        "dry_run": False,
-                        "apply": True,
-                    },
-                    timeout=300,
-                )
-            if resp.status_code != 200:
-                st.error(f"Apply failed: {resp.status_code} - {resp.text}")
-            else:
-                data = resp.json()
-                st.session_state.modify_repository_result = data
-                if data.get("success", False):
-                    st.success("Changes applied")
+res = st.session_state.modify_repository_result
+token = res.get("approval_token") if res else None
+repo = (
+    st.session_state.modify_repository_proposal.get("repository")
+    if st.session_state.modify_repository_proposal
+    else None
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Approve Changes", type="primary"):
+        if not token:
+            st.error("No active proposal to approve. Generate changes first.")
+        else:
+            try:
+                with st.spinner("Applying approved changes to repository..."):
+                    resp = requests.post(
+                        f"{BACKEND_URL}/modify-repository/approve",
+                        json={
+                            "approval_token": token,
+                            "repository": repo,
+                        },
+                        timeout=300,
+                    )
+                if resp.status_code != 200:
+                    st.error(f"Approval failed: {resp.status_code} - {resp.text}")
                 else:
-                    st.warning(data.get("error", "Apply did not complete"))
-        except Exception as exc:  # pragma: no cover
-            st.error(f"Failed to apply changes: {exc}")
+                    data = resp.json()
+                    st.session_state.modify_repository_result = data
+                    if data.get("success", False):
+                        st.success("Approved changes applied successfully!")
+                    else:
+                        st.error(data.get("error", "Application failed after approval."))
+            except Exception as exc:  # pragma: no cover
+                st.error(f"Failed to approve changes: {exc}")
+
+with col2:
+    if st.button("Reject Changes"):
+        if not token:
+            st.error("No active proposal to reject. Generate changes first.")
+        else:
+            try:
+                with st.spinner("Rejecting proposed changes..."):
+                    resp = requests.post(
+                        f"{BACKEND_URL}/modify-repository/reject",
+                        json={
+                            "approval_token": token,
+                            "repository": repo,
+                        },
+                        timeout=60,
+                    )
+                if resp.status_code != 200:
+                    st.error(f"Rejection failed: {resp.status_code} - {resp.text}")
+                else:
+                    data = resp.json()
+                    st.session_state.modify_repository_result = data
+                    st.warning("Proposed changes rejected. Filesystem remains untouched.")
+            except Exception as exc:  # pragma: no cover
+                st.error(f"Failed to reject changes: {exc}")
 
 
 st.subheader("Run Complete Workflow")

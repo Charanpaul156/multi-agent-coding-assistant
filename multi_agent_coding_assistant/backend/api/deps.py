@@ -36,6 +36,7 @@ from backend.application.rag_use_cases import (
     SearchRepositoryUseCase,
 )
 from backend.application.modify_repository_use_cases import ModifyRepositoryUseCase
+from backend.infrastructure.approval_store import ApprovalStore
 from backend.infrastructure.change_applier import ChangeApplier
 from backend.infrastructure.change_validation import ChangeValidator
 from rag.chunker import CodeChunker
@@ -244,6 +245,12 @@ def get_rag_status_use_case() -> GetRagStatusUseCase:
 
 
 @lru_cache(maxsize=1)
+def get_approval_store() -> ApprovalStore:
+    """Provide the in-memory ticket store for proposed ChangeSets."""
+    return ApprovalStore()
+
+
+@lru_cache(maxsize=1)
 def get_modify_repository_use_case() -> ModifyRepositoryUseCase:
     """Provide the repository-modification orchestrator.
 
@@ -264,6 +271,7 @@ def get_modify_repository_use_case() -> ModifyRepositoryUseCase:
         test_execution_use_case=get_test_execution_use_case(),
         review_use_case=get_review_code_use_case(),
         debugger_agent=get_debugger_agent(),
+        approval_store=get_approval_store(),
         max_iterations=get_settings().max_iterations,
     )
 

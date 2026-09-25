@@ -17,6 +17,7 @@ from backend.application.modify_repository_use_cases import (
 )
 from backend.domain.change_models import (
     ApplicationResult,
+    ApprovalStatus,
     ChangeOperation,
     ChangeSet,
     ChangeValidationResult,
@@ -220,11 +221,14 @@ def _build_use_case(
     )
 
 
-def _request(config, *, dry_run=False):
+def _request(config, *, dry_run=False, approval=None):
+    if approval is None:
+        approval = ApprovalStatus.PREVIEW if dry_run else ApprovalStatus.APPROVED
     return ModifyRepositoryRequest(
         repository_path=str(config.allowed_repository_roots[0]),
         request="add feature",
         dry_run=dry_run,
+        approval=approval,
     )
 
 
