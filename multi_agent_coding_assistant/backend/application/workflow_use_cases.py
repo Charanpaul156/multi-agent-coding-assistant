@@ -74,6 +74,8 @@ from backend.domain.change_models import (
     DiffEntry,
     ValidationReport,
 )
+from backend.application.event_emitter import EventEmitter
+from backend.domain.job_models import WorkflowEvent
 from rag.context import format_retrieved_context
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,8 @@ class WorkflowRequest:
     prompt: str
     repository_root: Optional[str] = None
     apply_repository_changes: bool = False
+    job_id: Optional[str] = None
+    event_emitter: Optional[EventEmitter] = None
 
 
 @dataclass
@@ -225,6 +229,7 @@ class RunWorkflowUseCase:
         repository_modify_use_case: Optional[ModifyRepositoryUseCase] = None,
         repository_debugger_agent: Optional[DebuggerAgent] = None,
         documentation_use_case: Optional[GenerateDocumentationUseCase] = None,
+        event_emitter: Optional[EventEmitter] = None,
         max_iterations: int = 3,
     ) -> None:
         self._plan_use_case = plan_use_case
@@ -239,7 +244,28 @@ class RunWorkflowUseCase:
         self._repository_modify_use_case = repository_modify_use_case
         self._repository_debugger_agent = repository_debugger_agent
         self._documentation_use_case = documentation_use_case
+        self._event_emitter = event_emitter
         self._max_iterations = max(1, int(max_iterations))
+
+    def _emit(
+        self,
+        emitter: Optional[EventEmitter],
+        job_id: Optional[str],
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Safely emit an observable progress event if emitter and job_id are present."""
+        if emitter is not None and job_id:
+            try:
+                emitter.emit(
+                    WorkflowEvent(
+                        event_type=event_type,
+                        job_id=job_id,
+                        payload=payload or {},
+                    )
+                )
+            except Exception as exc:
+                logger.warning("RunWorkflowUseCase: failed to emit event %r: %s", event_type, exc)
 
     def execute(self, request: WorkflowRequest) -> WorkflowResult:
         """Run the full workflow and return a (possibly partial) result."""
@@ -251,24 +277,50 @@ class RunWorkflowUseCase:
         if not request.prompt.strip():
             raise ValueError("prompt must be non-empty")
 
+        emitter = request.event_emitter or self._event_emitter
+        job_id = request.job_id or (getattr(emitter, "job_id", None) if emitter else None)
+
         logger.info("Workflow Started (prompt=%r)", request.prompt)
         start = time.perf_counter()
 
         repository_root = (request.repository_root or "").strip()
+        self._emit(
+            emitter,
+            job_id,
+            "workflow_started",
+            {
+                "repository_root": repository_root or None,
+                "has_repository": bool(repository_root),
+                "apply_repository_changes": request.apply_repository_changes,
+            },
+        )
+
         if repository_root:
             return self._execute_repository_workflow(
                 request,
                 start,
                 repository_root=repository_root,
+                emitter=emitter,
+                job_id=job_id,
             )
 
         # --- Stage 1: Planner ------------------------------------------------
+        self._emit(emitter, job_id, "step_start", {"step": "planner"})
         try:
             plan_result: GeneratePlanResult = self._plan_use_case.execute(
                 GeneratePlanRequest(prompt=request.prompt)
             )
             planning = plan_result.plan
             logger.info("Planner Finished")
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "planner",
+                    "plan_summary": getattr(planning, "summary", "") or "Plan generated",
+                },
+            )
         except Exception as exc:
             logger.exception("Planner FAILED")
             return self._fail(
@@ -277,15 +329,27 @@ class RunWorkflowUseCase:
                 request.prompt,
                 start,
                 error=str(exc),
+                emitter=emitter,
+                job_id=job_id,
             )
 
         # --- Stage 2: Coder (initial generation only) -----------------------
+        self._emit(emitter, job_id, "step_start", {"step": "coder"})
         try:
             code_result: GenerateCodeResult = self._coder_use_case.execute(
                 GenerateCodeRequest(prompt=request.prompt)
             )
             current_code = code_result.generated_code
             logger.info("Coder Finished")
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "coder",
+                    "code_length": len(current_code) if current_code else 0,
+                },
+            )
         except Exception as exc:
             logger.exception("Coder FAILED")
             return self._fail(
@@ -295,6 +359,8 @@ class RunWorkflowUseCase:
                 start,
                 planning=planning,
                 error=str(exc),
+                emitter=emitter,
+                job_id=job_id,
             )
 
         # --- Self-correction loop -------------------------------------------
@@ -305,10 +371,21 @@ class RunWorkflowUseCase:
         stable_tests: Optional[str] = None
 
         while True:
+            self._emit(
+                emitter,
+                job_id,
+                "iteration_progress",
+                {
+                    "iteration": iteration_number,
+                    "max_iterations": self._max_iterations,
+                },
+            )
             iteration = self._run_iteration(
                 generated_code=current_code,
                 iteration_number=iteration_number,
                 existing_tests=stable_tests,
+                emitter=emitter,
+                job_id=job_id,
             )
             iterations.append(iteration)
             if stable_tests is None and iteration.generated_tests is not None:
@@ -338,15 +415,41 @@ class RunWorkflowUseCase:
                     "Workflow reached maximum iterations (%d)", self._max_iterations
                 )
                 final_status = WorkflowStatus.MAX_ITERATIONS_REACHED
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "iteration_limit",
+                        "status": WorkflowStatus.MAX_ITERATIONS_REACHED.value,
+                        "iterations": iteration_number,
+                    },
+                )
                 break
 
             if self._debug_use_case is None:
                 logger.warning("Debugger not available; stopping correction loop")
                 final_status = WorkflowStatus.DEBUGGER_FAILED
                 final_error = "Debugger not available"
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "debugger",
+                        "status": WorkflowStatus.DEBUGGER_FAILED.value,
+                        "error": "Debugger not available",
+                    },
+                )
                 break
 
             # Run the Debugger to produce a corrected version.
+            self._emit(
+                emitter,
+                job_id,
+                "step_start",
+                {"step": "debugger", "iteration": iteration_number},
+            )
             try:
                 debug_result = self._debug_use_case.execute(
                     DebugCodeRequest(
@@ -391,10 +494,30 @@ class RunWorkflowUseCase:
                     "Debugger produced correction for iteration %d",
                     iteration_number,
                 )
+                self._emit(
+                    emitter,
+                    job_id,
+                    "step_complete",
+                    {
+                        "step": "debugger",
+                        "iteration": iteration_number,
+                        "corrected": True,
+                    },
+                )
             except Exception as exc:
                 logger.exception("Debugger FAILED")
                 final_status = WorkflowStatus.DEBUGGER_FAILED
                 final_error = str(exc)
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "debugger",
+                        "status": WorkflowStatus.DEBUGGER_FAILED.value,
+                        "error": str(exc),
+                    },
+                )
                 break
 
             iteration_number += 1
@@ -410,6 +533,7 @@ class RunWorkflowUseCase:
         documentation: Optional[DocumentationReport] = None
         documentation_error: Optional[str] = None
         if success and self._documentation_use_case is not None:
+            self._emit(emitter, job_id, "step_start", {"step": "documentation"})
             (
                 documentation,
                 documentation_error,
@@ -418,6 +542,40 @@ class RunWorkflowUseCase:
                 code=last.generated_code,
                 retrieved_context=None,
                 final_status=final_status or WorkflowStatus.COMPLETED,
+            )
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "documentation",
+                    "has_documentation": documentation is not None,
+                    "error": documentation_error,
+                },
+            )
+
+        if success:
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_completed",
+                {
+                    "status": final_status.value if final_status else "completed",
+                    "iterations": len(iterations),
+                    "execution_time_ms": elapsed_ms,
+                },
+            )
+        else:
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_failed",
+                {
+                    "status": final_status.value if final_status else "failed",
+                    "error": final_error,
+                    "iterations": len(iterations),
+                    "execution_time_ms": elapsed_ms,
+                },
             )
 
         return WorkflowResult(
@@ -443,6 +601,8 @@ class RunWorkflowUseCase:
         start: float,
         *,
         repository_root: str,
+        emitter: Optional[EventEmitter] = None,
+        job_id: Optional[str] = None,
     ) -> WorkflowResult:
         """Run the repository-aware workflow branch."""
 
@@ -453,6 +613,8 @@ class RunWorkflowUseCase:
                 request.prompt,
                 start,
                 error="repository modify use-case is not available",
+                emitter=emitter,
+                job_id=job_id,
             )
         if self._repository_coder_agent is None:
             return self._fail(
@@ -461,6 +623,8 @@ class RunWorkflowUseCase:
                 request.prompt,
                 start,
                 error="repository coder is not available",
+                emitter=emitter,
+                job_id=job_id,
             )
 
         repository_context = self._retrieve_repository_context(
@@ -469,6 +633,7 @@ class RunWorkflowUseCase:
         )
 
         # --- Stage 1: Planner ----------------------------------------------
+        self._emit(emitter, job_id, "step_start", {"step": "planner"})
         try:
             plan_result: GeneratePlanResult = self._plan_use_case.execute(
                 GeneratePlanRequest(
@@ -478,6 +643,15 @@ class RunWorkflowUseCase:
             )
             planning = plan_result.plan
             logger.info("Repository Planner Finished")
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "planner",
+                    "plan_summary": getattr(planning, "summary", "") or "Plan generated",
+                },
+            )
         except Exception as exc:
             logger.exception("Repository Planner FAILED")
             return self._fail(
@@ -486,9 +660,12 @@ class RunWorkflowUseCase:
                 request.prompt,
                 start,
                 error=str(exc),
+                emitter=emitter,
+                job_id=job_id,
             )
 
         # --- Stage 2: Repository-aware coder -------------------------------
+        self._emit(emitter, job_id, "step_start", {"step": "coder"})
         try:
             change_set = self._repository_coder_agent.generate_changes(
                 request.prompt,
@@ -496,6 +673,15 @@ class RunWorkflowUseCase:
                 retrieved_context=repository_context or None,
             )
             logger.info("Repository Coder Finished")
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "coder",
+                    "code_length": len(self._combined_repository_source(change_set)),
+                },
+            )
         except Exception as exc:
             logger.exception("Repository Coder FAILED")
             return self._fail(
@@ -505,6 +691,8 @@ class RunWorkflowUseCase:
                 start,
                 planning=planning,
                 error=str(exc),
+                emitter=emitter,
+                job_id=job_id,
             )
 
         # --- Stage 3: Validate / proposal dry run ---------------------------
@@ -514,6 +702,8 @@ class RunWorkflowUseCase:
                 change_set=change_set,
                 dry_run=True,
                 approval=ApprovalStatus.PREVIEW,
+                job_id=job_id,
+                event_emitter=emitter,
             )
         )
         initial_proposal = proposal
@@ -525,6 +715,16 @@ class RunWorkflowUseCase:
                 else WorkflowStatus.REPOSITORY_APPLICATION_FAILED
             )
             elapsed_ms = (time.perf_counter() - start) * 1000
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_failed",
+                {
+                    "stage": "repository_validation",
+                    "status": status.value,
+                    "error": proposal.error,
+                },
+            )
             return WorkflowResult(
                 success=False,
                 workflow_status=status,
@@ -549,6 +749,16 @@ class RunWorkflowUseCase:
 
         if not request.apply_repository_changes:
             elapsed_ms = (time.perf_counter() - start) * 1000
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_completed",
+                {
+                    "status": WorkflowStatus.REPOSITORY_PROPOSED.value,
+                    "iterations": 0,
+                    "execution_time_ms": elapsed_ms,
+                },
+            )
             return WorkflowResult(
                 success=True,
                 workflow_status=WorkflowStatus.REPOSITORY_PROPOSED,
@@ -577,10 +787,22 @@ class RunWorkflowUseCase:
                 change_set=change_set,
                 dry_run=False,
                 approval=ApprovalStatus.APPROVED,
+                job_id=job_id,
+                event_emitter=emitter,
             )
         )
         if not application.success:
             elapsed_ms = (time.perf_counter() - start) * 1000
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_failed",
+                {
+                    "stage": "repository_application",
+                    "status": WorkflowStatus.REPOSITORY_APPLICATION_FAILED.value,
+                    "error": application.error,
+                },
+            )
             return WorkflowResult(
                 success=False,
                 workflow_status=WorkflowStatus.REPOSITORY_APPLICATION_FAILED,
@@ -612,10 +834,21 @@ class RunWorkflowUseCase:
         stable_tests: Optional[str] = None
 
         while True:
+            self._emit(
+                emitter,
+                job_id,
+                "iteration_progress",
+                {
+                    "iteration": iteration_number,
+                    "max_iterations": self._max_iterations,
+                },
+            )
             iteration = self._run_repository_iteration(
                 change_set=current_change_set,
                 iteration_number=iteration_number,
                 existing_tests=stable_tests,
+                emitter=emitter,
+                job_id=job_id,
             )
             iteration.repository_change_set = current_change_set
             iteration.repository_validation = current_application.validation_result
@@ -646,6 +879,16 @@ class RunWorkflowUseCase:
                     self._max_iterations,
                 )
                 final_status = WorkflowStatus.MAX_ITERATIONS_REACHED
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "iteration_limit",
+                        "status": WorkflowStatus.MAX_ITERATIONS_REACHED.value,
+                        "iterations": iteration_number,
+                    },
+                )
                 break
 
             if self._repository_debugger_agent is None:
@@ -654,18 +897,54 @@ class RunWorkflowUseCase:
                 )
                 final_status = WorkflowStatus.DEBUGGER_FAILED
                 final_error = "Repository debugger not available"
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "debugger",
+                        "status": WorkflowStatus.DEBUGGER_FAILED.value,
+                        "error": "Repository debugger not available",
+                    },
+                )
                 break
 
+            self._emit(
+                emitter,
+                job_id,
+                "step_start",
+                {"step": "debugger", "iteration": iteration_number},
+            )
             try:
                 corrected = self._repository_debugger_agent.correct_changes(
                     current_change_set,
                     feedback=feedback,
                     retrieved_context=repository_context or None,
                 )
+                self._emit(
+                    emitter,
+                    job_id,
+                    "step_complete",
+                    {
+                        "step": "debugger",
+                        "iteration": iteration_number,
+                        "corrected": True,
+                    },
+                )
             except Exception as exc:
                 logger.exception("Repository debugger FAILED")
                 final_status = WorkflowStatus.DEBUGGER_FAILED
                 final_error = str(exc)
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "debugger",
+                        "status": WorkflowStatus.DEBUGGER_FAILED.value,
+                        "error": str(exc),
+                    },
+                )
                 break
 
             proposal = self._repository_modify_use_case.execute(
@@ -674,6 +953,8 @@ class RunWorkflowUseCase:
                     change_set=corrected,
                     dry_run=True,
                     approval=ApprovalStatus.PREVIEW,
+                    job_id=job_id,
+                    event_emitter=emitter,
                 )
             )
             if not proposal.success:
@@ -684,6 +965,16 @@ class RunWorkflowUseCase:
                     else WorkflowStatus.REPOSITORY_APPLICATION_FAILED
                 )
                 elapsed_ms = (time.perf_counter() - start) * 1000
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "repository_validation",
+                        "status": status.value,
+                        "error": proposal.error,
+                    },
+                )
                 return WorkflowResult(
                     success=False,
                     workflow_status=status,
@@ -712,10 +1003,22 @@ class RunWorkflowUseCase:
                     change_set=corrected,
                     dry_run=False,
                     approval=ApprovalStatus.APPROVED,
+                    job_id=job_id,
+                    event_emitter=emitter,
                 )
             )
             if not application.success:
                 elapsed_ms = (time.perf_counter() - start) * 1000
+                self._emit(
+                    emitter,
+                    job_id,
+                    "workflow_failed",
+                    {
+                        "stage": "repository_application",
+                        "status": WorkflowStatus.REPOSITORY_APPLICATION_FAILED.value,
+                        "error": application.error,
+                    },
+                )
                 return WorkflowResult(
                     success=False,
                     workflow_status=WorkflowStatus.REPOSITORY_APPLICATION_FAILED,
@@ -752,6 +1055,7 @@ class RunWorkflowUseCase:
         documentation: Optional[DocumentationReport] = None
         documentation_error: Optional[str] = None
         if success and self._documentation_use_case is not None:
+            self._emit(emitter, job_id, "step_start", {"step": "documentation"})
             (
                 documentation,
                 documentation_error,
@@ -760,6 +1064,40 @@ class RunWorkflowUseCase:
                 code=self._combined_repository_source(current_change_set),
                 retrieved_context=repository_context or None,
                 final_status=final_status or WorkflowStatus.COMPLETED,
+            )
+            self._emit(
+                emitter,
+                job_id,
+                "step_complete",
+                {
+                    "step": "documentation",
+                    "has_documentation": documentation is not None,
+                    "error": documentation_error,
+                },
+            )
+
+        if success:
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_completed",
+                {
+                    "status": final_status.value if final_status else "completed",
+                    "iterations": len(iterations),
+                    "execution_time_ms": elapsed_ms,
+                },
+            )
+        else:
+            self._emit(
+                emitter,
+                job_id,
+                "workflow_failed",
+                {
+                    "status": final_status.value if final_status else "failed",
+                    "error": final_error,
+                    "iterations": len(iterations),
+                    "execution_time_ms": elapsed_ms,
+                },
             )
 
         return WorkflowResult(
@@ -814,12 +1152,20 @@ class RunWorkflowUseCase:
         change_set: ChangeSet,
         iteration_number: int,
         existing_tests: Optional[str] = None,
+        emitter: Optional[EventEmitter] = None,
+        job_id: Optional[str] = None,
     ) -> WorkflowIteration:
         """Run one repository-aware iteration without code execution."""
 
         logger.info("Repository workflow iteration %d: starting", iteration_number)
         generated_source = self._combined_repository_source(change_set)
 
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "test_generator", "iteration": iteration_number},
+        )
         generated_tests: Optional[str] = existing_tests
         test_error: Optional[str] = None
         if generated_tests is None:
@@ -846,8 +1192,26 @@ class RunWorkflowUseCase:
                 iteration_number,
             )
 
+        self._emit(
+            emitter,
+            job_id,
+            "step_complete",
+            {
+                "step": "test_generator",
+                "iteration": iteration_number,
+                "has_tests": generated_tests is not None,
+                "test_error": test_error,
+            },
+        )
+
         test_execution: Optional[TestExecutionResponse] = None
         if generated_tests is not None:
+            self._emit(
+                emitter,
+                job_id,
+                "step_start",
+                {"step": "test_executor", "iteration": iteration_number},
+            )
             try:
                 repo_files = {
                     c.file_path: c.new_content
@@ -872,12 +1236,31 @@ class RunWorkflowUseCase:
                     exc,
                 )
                 test_execution = None
+
+            self._emit(
+                emitter,
+                job_id,
+                "test_result",
+                {
+                    "iteration": iteration_number,
+                    "success": test_execution.success if test_execution else False,
+                    "passed": getattr(test_execution, "passed", 0) or 0,
+                    "failed": getattr(test_execution, "failed", 0) or 0,
+                    "exit_code": test_execution.exit_code if test_execution else None,
+                },
+            )
         else:
             logger.info(
                 "Repository workflow iteration %d: Test Execution SKIPPED (no tests)",
                 iteration_number,
             )
 
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "reviewer", "iteration": iteration_number},
+        )
         review: Optional[ReviewReport] = None
         review_error: Optional[str] = None
         try:
@@ -908,6 +1291,23 @@ class RunWorkflowUseCase:
             )
             review = None
             review_error = str(exc)
+
+        self._emit(
+            emitter,
+            job_id,
+            "review_result",
+            {
+                "iteration": iteration_number,
+                "score": getattr(review, "overall_score", None) if review else None,
+                "has_issues": bool(
+                    review
+                    and (
+                        getattr(review, "logic_issues", None)
+                        or getattr(review, "security_concerns", None)
+                    )
+                ),
+            },
+        )
 
         return WorkflowIteration(
             iteration_number=iteration_number,
@@ -946,6 +1346,8 @@ class RunWorkflowUseCase:
         generated_code: str,
         iteration_number: int,
         existing_tests: Optional[str] = None,
+        emitter: Optional[EventEmitter] = None,
+        job_id: Optional[str] = None,
     ) -> WorkflowIteration:
         """Run one full pipeline pass and return a WorkflowIteration.
 
@@ -955,6 +1357,12 @@ class RunWorkflowUseCase:
         logger.info("Workflow iteration %d: starting", iteration_number)
 
         # --- Test Generator -------------------------------------------------
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "test_generator", "iteration": iteration_number},
+        )
         generated_tests: Optional[str] = existing_tests
         test_error: Optional[str] = None
         if generated_tests is None:
@@ -978,7 +1386,25 @@ class RunWorkflowUseCase:
                 iteration_number,
             )
 
+        self._emit(
+            emitter,
+            job_id,
+            "step_complete",
+            {
+                "step": "test_generator",
+                "iteration": iteration_number,
+                "has_tests": generated_tests is not None,
+                "test_error": test_error,
+            },
+        )
+
         # --- Application Execution ------------------------------------------
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "executor", "iteration": iteration_number},
+        )
         execution: Optional[ExecutionResponse] = None
         try:
             execution = self._execute_use_case.execute(
@@ -993,7 +1419,24 @@ class RunWorkflowUseCase:
             )
             execution = None
 
+        self._emit(
+            emitter,
+            job_id,
+            "step_complete",
+            {
+                "step": "executor",
+                "iteration": iteration_number,
+                "success": execution.success if execution else False,
+            },
+        )
+
         # --- Test Execution -------------------------------------------------
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "test_executor", "iteration": iteration_number},
+        )
         test_execution: Optional[TestExecutionResponse] = None
         if generated_tests is not None:
             try:
@@ -1017,7 +1460,26 @@ class RunWorkflowUseCase:
                 iteration_number,
             )
 
+        self._emit(
+            emitter,
+            job_id,
+            "test_result",
+            {
+                "iteration": iteration_number,
+                "success": test_execution.success if test_execution else False,
+                "passed": getattr(test_execution, "passed", 0) or 0,
+                "failed": getattr(test_execution, "failed", 0) or 0,
+                "exit_code": test_execution.exit_code if test_execution else None,
+            },
+        )
+
         # --- Reviewer -------------------------------------------------------
+        self._emit(
+            emitter,
+            job_id,
+            "step_start",
+            {"step": "reviewer", "iteration": iteration_number},
+        )
         review: Optional[ReviewReport] = None
         review_error: Optional[str] = None
         try:
@@ -1049,6 +1511,23 @@ class RunWorkflowUseCase:
             )
             review = None
             review_error = str(exc)
+
+        self._emit(
+            emitter,
+            job_id,
+            "review_result",
+            {
+                "iteration": iteration_number,
+                "score": getattr(review, "overall_score", None) if review else None,
+                "has_issues": bool(
+                    review
+                    and (
+                        getattr(review, "logic_issues", None)
+                        or getattr(review, "security_concerns", None)
+                    )
+                ),
+            },
+        )
 
         return WorkflowIteration(
             iteration_number=iteration_number,
@@ -1167,11 +1646,23 @@ class RunWorkflowUseCase:
         *,
         planning: Optional[ImplementationPlan] = None,
         error: Optional[str] = None,
+        emitter: Optional[EventEmitter] = None,
+        job_id: Optional[str] = None,
     ) -> WorkflowResult:
         """Build a partial failure result for a critical stage."""
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         logger.warning("Workflow FAILED at %s (%.2f ms)", stage, elapsed_ms)
+        self._emit(
+            emitter,
+            job_id,
+            "workflow_failed",
+            {
+                "stage": stage,
+                "status": status.value,
+                "error": error,
+            },
+        )
         return WorkflowResult(
             success=False,
             workflow_status=status,

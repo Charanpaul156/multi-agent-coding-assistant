@@ -28,8 +28,10 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
+from backend.application.event_emitter import EventEmitter
+from backend.domain.job_models import WorkflowEvent
 from backend.domain.change_models import (
     ApplicationResult,
     ApprovalStatus,
@@ -104,6 +106,8 @@ class ModifyRepositoryRequest:
     repository_root: Optional[str] = None
     approval: ApprovalStatus = ApprovalStatus.PREVIEW
     approval_token: Optional[str] = None
+    job_id: Optional[str] = None
+    event_emitter: Optional[EventEmitter] = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,7 @@ class ModifyRepositoryUseCase:
         review_use_case: Optional[ReviewCodeUseCase] = None,
         debugger_agent: Optional[DebuggerAgent] = None,
         approval_store: Optional[ApprovalStore] = None,
+        event_emitter: Optional[EventEmitter] = None,
         max_iterations: int = 3,
     ) -> None:
         self._config = config
@@ -191,13 +196,41 @@ class ModifyRepositoryUseCase:
         self._review_use_case = review_use_case
         self._debugger_agent = debugger_agent
         self._approval_store = approval_store
+        self._event_emitter = event_emitter
         self._max_iterations = max(1, int(max_iterations))
+
+    def _emit(
+        self,
+        emitter: Optional[EventEmitter],
+        job_id: Optional[str],
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Safely emit an observable progress event if emitter and job_id are present."""
+        if emitter is not None and job_id:
+            try:
+                emitter.emit(
+                    WorkflowEvent(
+                        event_type=event_type,
+                        job_id=job_id,
+                        payload=payload or {},
+                    )
+                )
+            except Exception as exc:
+                logger.warning("ModifyRepositoryUseCase: failed to emit event %r: %s", event_type, exc)
 
     # ------------------------------------------------------------------ #
     # Public entry point
     # ------------------------------------------------------------------ #
 
-    def approve(self, token: str, repository_path: str = "") -> ModifyRepositoryResult:
+    def approve(
+        self,
+        token: str,
+        repository_path: str = "",
+        *,
+        job_id: Optional[str] = None,
+        event_emitter: Optional[EventEmitter] = None,
+    ) -> ModifyRepositoryResult:
         """Approve and apply an existing proposed change ticket."""
         return self.execute(
             ModifyRepositoryRequest(
@@ -205,10 +238,19 @@ class ModifyRepositoryUseCase:
                 approval_token=token,
                 approval=ApprovalStatus.APPROVED,
                 dry_run=False,
+                job_id=job_id,
+                event_emitter=event_emitter,
             )
         )
 
-    def reject(self, token: str, repository_path: str = "") -> ModifyRepositoryResult:
+    def reject(
+        self,
+        token: str,
+        repository_path: str = "",
+        *,
+        job_id: Optional[str] = None,
+        event_emitter: Optional[EventEmitter] = None,
+    ) -> ModifyRepositoryResult:
         """Reject an existing proposed change ticket."""
         return self.execute(
             ModifyRepositoryRequest(
@@ -216,6 +258,8 @@ class ModifyRepositoryUseCase:
                 approval_token=token,
                 approval=ApprovalStatus.REJECTED,
                 dry_run=True,
+                job_id=job_id,
+                event_emitter=event_emitter,
             )
         )
 
@@ -224,6 +268,15 @@ class ModifyRepositoryUseCase:
         self._validate_request(request)
 
         repo_path = request.repository_path or request.repository_root or ""
+        emitter = request.event_emitter or self._event_emitter
+        job_id = request.job_id
+
+        self._emit(
+            emitter,
+            job_id,
+            "modification_started",
+            {"repository_path": repo_path, "dry_run": request.dry_run},
+        )
 
         logger.info(
             "ModifyRepositoryUseCase: start repo=%r dry_run=%r approval=%r",
@@ -240,9 +293,27 @@ class ModifyRepositoryUseCase:
         if request.change_set is not None:
             change_set = self._augment_original(request.change_set, repository_path=repo_path)
             validation = self._validate(change_set)
+            self._emit(
+                emitter,
+                job_id,
+                "validation_complete",
+                {"valid": validation.valid},
+            )
             diffs = self._build_diffs(change_set)
+            self._emit(
+                emitter,
+                job_id,
+                "diff_generated",
+                {"diff_count": len(diffs)},
+            )
 
             if not validation.valid:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "validation_failed"},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.VALIDATION_FAILED,
@@ -266,6 +337,12 @@ class ModifyRepositoryUseCase:
                 token = ticket.token
 
             if request.dry_run:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "approval_required",
+                    {"approval_status": "preview", "requires_approval": True},
+                )
                 return ModifyRepositoryResult(
                     success=True,
                     status=ModifyRepositoryStatus.PROPOSED,
@@ -280,6 +357,20 @@ class ModifyRepositoryUseCase:
 
             # Enforce approval == APPROVED before calling ChangeApplier
             if request.approval != ApprovalStatus.APPROVED:
+                if request.approval == ApprovalStatus.REJECTED:
+                    self._emit(
+                        emitter,
+                        job_id,
+                        "approval_rejected",
+                        {"approval_status": "rejected"},
+                    )
+                else:
+                    self._emit(
+                        emitter,
+                        job_id,
+                        "approval_required",
+                        {"approval_status": "preview", "requires_approval": True},
+                    )
                 return ModifyRepositoryResult(
                     success=False,
                     status=(
@@ -303,6 +394,18 @@ class ModifyRepositoryUseCase:
 
             stale_error = self._check_stale(change_set, repository_path=repo_path)
             if stale_error:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "stale_change_detected",
+                    {},
+                )
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "stale_changes"},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -316,12 +419,32 @@ class ModifyRepositoryUseCase:
                     error=stale_error,
                 )
 
+            self._emit(
+                emitter,
+                job_id,
+                "approval_approved",
+                {"approval_status": "approved"},
+            )
             application = self._apply(change_set)
             status = (
                 ModifyRepositoryStatus.APPLIED
                 if application.success
                 else ModifyRepositoryStatus.APPLICATION_FAILED
             )
+            if application.success:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "changes_applied",
+                    {"file_count": len(application.applied_files)},
+                )
+            else:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "application_failed"},
+                )
             if application.success and token and self._approval_store:
                 self._approval_store.update_status(token, ApprovalStatus.APPLIED)
 
@@ -369,7 +492,19 @@ class ModifyRepositoryUseCase:
 
         # --- Stage 4: Validate -----------------------------------------
         validation = self._validate(change_set)
+        self._emit(
+            emitter,
+            job_id,
+            "validation_complete",
+            {"valid": validation.valid},
+        )
         if not validation.valid:
+            self._emit(
+                emitter,
+                job_id,
+                "modification_failed",
+                {"reason": "validation_failed"},
+            )
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.VALIDATION_FAILED,
@@ -384,6 +519,12 @@ class ModifyRepositoryUseCase:
             )
 
         diffs = self._build_diffs(change_set)
+        self._emit(
+            emitter,
+            job_id,
+            "diff_generated",
+            {"diff_count": len(diffs)},
+        )
 
         token = None
         if self._approval_store is not None:
@@ -397,6 +538,12 @@ class ModifyRepositoryUseCase:
 
         # --- Dry-run: do not write -------------------------------------
         if request.dry_run:
+            self._emit(
+                emitter,
+                job_id,
+                "approval_required",
+                {"approval_status": "preview", "requires_approval": True},
+            )
             return ModifyRepositoryResult(
                 success=True,
                 status=ModifyRepositoryStatus.PROPOSED,
@@ -412,6 +559,20 @@ class ModifyRepositoryUseCase:
 
         # Enforce approval == APPROVED before calling ChangeApplier
         if request.approval != ApprovalStatus.APPROVED:
+            if request.approval == ApprovalStatus.REJECTED:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "approval_rejected",
+                    {"approval_status": "rejected"},
+                )
+            else:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "approval_required",
+                    {"approval_status": "preview", "requires_approval": True},
+                )
             return ModifyRepositoryResult(
                 success=False,
                 status=(
@@ -436,6 +597,18 @@ class ModifyRepositoryUseCase:
 
         stale_error = self._check_stale(change_set, repository_path=request.repository_path)
         if stale_error:
+            self._emit(
+                emitter,
+                job_id,
+                "stale_change_detected",
+                {},
+            )
+            self._emit(
+                emitter,
+                job_id,
+                "modification_failed",
+                {"reason": "stale_changes"},
+            )
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -449,6 +622,13 @@ class ModifyRepositoryUseCase:
                 diffs=diffs,
                 error=stale_error,
             )
+
+        self._emit(
+            emitter,
+            job_id,
+            "approval_approved",
+            {"approval_status": "approved"},
+        )
 
         # --- Stage 5+: Apply + validate + self-correct -----------------
         result = self._apply_and_validate(
@@ -475,6 +655,8 @@ class ModifyRepositoryUseCase:
         diffs: list[DiffEntry],
     ) -> ModifyRepositoryResult:
         """Apply, run tests/review, and self-correct up to max_iterations."""
+        emitter = request.event_emitter or self._event_emitter
+        job_id = request.job_id
         current_set = change_set
         iterations: list[ChangeIteration] = []
         iteration_number = 1
@@ -492,6 +674,12 @@ class ModifyRepositoryUseCase:
             iterations.append(iteration)
 
             if not application.success:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "application_failed", "iteration": iteration_number},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -505,6 +693,13 @@ class ModifyRepositoryUseCase:
                     iterations=iterations,
                     error=application.error,
                 )
+
+            self._emit(
+                emitter,
+                job_id,
+                "changes_applied",
+                {"file_count": len(application.applied_files), "iteration": iteration_number},
+            )
 
             # Validate the applied result via tests + review.
             feedback = self._validate_applied(current_set, application)
@@ -536,6 +731,12 @@ class ModifyRepositoryUseCase:
 
             # Need correction.
             if iteration_number >= self._max_iterations:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "max_iterations_reached", "iteration": iteration_number},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.MAX_ITERATIONS_REACHED,
@@ -551,6 +752,12 @@ class ModifyRepositoryUseCase:
                 )
 
             if self._debugger_agent is None:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "debugger_unavailable"},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.DEBUGGER_FAILED,
@@ -575,6 +782,12 @@ class ModifyRepositoryUseCase:
                 corrected = self._augment_original(corrected, repository_path=request.repository_path)
             except Exception as exc:
                 logger.exception("ModifyRepositoryUseCase: debugger failed")
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "debugger_failed"},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.DEBUGGER_FAILED,
@@ -591,7 +804,19 @@ class ModifyRepositoryUseCase:
 
             # Re-validate the corrected change set.
             new_validation = self._validate(corrected)
+            self._emit(
+                emitter,
+                job_id,
+                "validation_complete",
+                {"valid": new_validation.valid, "iteration": iteration_number},
+            )
             if not new_validation.valid:
+                self._emit(
+                    emitter,
+                    job_id,
+                    "modification_failed",
+                    {"reason": "validation_failed", "iteration": iteration_number},
+                )
                 return ModifyRepositoryResult(
                     success=False,
                     status=ModifyRepositoryStatus.VALIDATION_FAILED,
@@ -619,7 +844,11 @@ class ModifyRepositoryUseCase:
         self, request: ModifyRepositoryRequest, repo_path: str
     ) -> ModifyRepositoryResult:
         """Process an approval or rejection for an existing proposed change ticket."""
+        emitter = request.event_emitter or self._event_emitter
+        job_id = request.job_id
+
         if self._approval_store is None:
+            self._emit(emitter, job_id, "modification_failed", {"reason": "approval_store_not_configured"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -632,6 +861,7 @@ class ModifyRepositoryUseCase:
 
         ticket = self._approval_store.get_ticket(request.approval_token)
         if ticket is None:
+            self._emit(emitter, job_id, "modification_failed", {"reason": "invalid_or_expired_token"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -647,6 +877,7 @@ class ModifyRepositoryUseCase:
         if repo_path and ticket.repository_path:
             try:
                 if Path(repo_path).expanduser().resolve() != Path(ticket.repository_path).expanduser().resolve():
+                    self._emit(emitter, job_id, "modification_failed", {"reason": "token_repo_mismatch"})
                     return ModifyRepositoryResult(
                         success=False,
                         status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -662,6 +893,7 @@ class ModifyRepositoryUseCase:
         # Handle rejection
         if request.approval == ApprovalStatus.REJECTED or ticket.status == ApprovalStatus.REJECTED:
             self._approval_store.update_status(ticket.token, ApprovalStatus.REJECTED)
+            self._emit(emitter, job_id, "approval_rejected", {"approval_status": "rejected"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.REJECTED,
@@ -677,6 +909,7 @@ class ModifyRepositoryUseCase:
 
         # Prevent re-applying already-applied changes
         if ticket.status == ApprovalStatus.APPLIED:
+            self._emit(emitter, job_id, "modification_failed", {"reason": "already_applied"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -692,6 +925,7 @@ class ModifyRepositoryUseCase:
 
         # Enforce approval == APPROVED before calling ChangeApplier
         if request.approval != ApprovalStatus.APPROVED:
+            self._emit(emitter, job_id, "approval_required", {"approval_status": "preview", "requires_approval": True})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.PROPOSED,
@@ -708,6 +942,8 @@ class ModifyRepositoryUseCase:
         # Check for stale repository state
         stale_error = self._check_stale(ticket.change_set, repository_path=target_repo)
         if stale_error:
+            self._emit(emitter, job_id, "stale_change_detected", {})
+            self._emit(emitter, job_id, "modification_failed", {"reason": "stale_changes"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.APPLICATION_FAILED,
@@ -723,6 +959,7 @@ class ModifyRepositoryUseCase:
 
         # Re-verify validation
         if not ticket.validation.valid:
+            self._emit(emitter, job_id, "modification_failed", {"reason": "validation_failed"})
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.VALIDATION_FAILED,
@@ -737,6 +974,7 @@ class ModifyRepositoryUseCase:
             )
 
         # Apply approved ChangeSet via ChangeApplier
+        self._emit(emitter, job_id, "approval_approved", {"approval_status": "approved"})
         application = self._apply(ticket.change_set)
         status = (
             ModifyRepositoryStatus.APPLIED
@@ -744,7 +982,10 @@ class ModifyRepositoryUseCase:
             else ModifyRepositoryStatus.APPLICATION_FAILED
         )
         if application.success:
+            self._emit(emitter, job_id, "changes_applied", {"file_count": len(application.applied_files)})
             self._approval_store.update_status(ticket.token, ApprovalStatus.APPLIED)
+        else:
+            self._emit(emitter, job_id, "modification_failed", {"reason": "application_failed"})
 
         return ModifyRepositoryResult(
             success=application.success,
