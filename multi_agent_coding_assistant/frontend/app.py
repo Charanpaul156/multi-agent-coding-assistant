@@ -5,10 +5,23 @@ UI for the Multi-Agent Coding Assistant.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 
 import requests
 import streamlit as st
+
+from frontend.workflow_ui import (
+    WorkflowProgressState,
+    format_progress_timeline,
+    iter_sse_events,
+    map_workflow_event,
+    poll_workflow_job,
+    sanitize_error_message,
+)
+
+logger = logging.getLogger(__name__)
 
 BACKEND_URL = "http://localhost:8000"
 
@@ -784,13 +797,16 @@ def _render_execution(exec_obj, title):
             st.code(exec_obj.get("stderr"), language="text")
 
 
-if st.session_state.workflow:
-    wf = st.session_state.workflow
+def _render_workflow_result(wf: dict | None, title_prefix: str = "Workflow") -> None:
+    """Render full workflow result object including plan, code, tests, review, doc, and iterations."""
+    if not wf:
+        return
+
     st.write(f"Workflow Status: {wf.get('workflow_status', '')}")
     st.write(f"Execution Time (ms): {wf.get('execution_time_ms', '')}")
 
     if wf.get("error"):
-        st.error(wf.get("error"))
+        st.error(sanitize_error_message(str(wf.get("error"))))
 
     if wf.get("test_error"):
         st.warning(f"Test generation issue: {wf.get('test_error')}")
@@ -798,7 +814,7 @@ if st.session_state.workflow:
     # 1. Implementation Plan
     wf_plan = wf.get("planning")
     if wf_plan:
-        with st.expander("Workflow Plan"):
+        with st.expander(f"{title_prefix} Plan"):
             st.write(f"Problem Summary: {wf_plan.get('problem_summary', '')}")
             st.write(f"Project Type: {wf_plan.get('project_type', '')}")
             st.write("\n".join(wf_plan.get("requirements", []) or []))
@@ -807,39 +823,55 @@ if st.session_state.workflow:
     # 2. Final Generated Code
     wf_code = wf.get("generated_code")
     if wf_code:
-        st.subheader("Workflow Final Generated Code")
-        st.code(_normalize_newlines_for_display(wf_code), language="python")
+        st.subheader(f"{title_prefix} Final Generated Code")
+        norm_code = _normalize_newlines_for_display(wf_code)
+        st.code(norm_code, language="python")
+        st.download_button(
+            label=f"Download {title_prefix.lower()}_generated_code.py",
+            data=norm_code,
+            file_name=f"{title_prefix.lower()}_generated_code.py",
+            mime="text/x-python",
+            key=f"dl_code_{title_prefix.lower()}_{hash(title_prefix)}",
+        )
 
     # 3. Final Generated Tests
     wf_tests = wf.get("generated_tests")
     if wf_tests:
-        st.subheader("Workflow Final Generated Tests")
-        st.code(_normalize_newlines_for_display(wf_tests), language="python")
+        st.subheader(f"{title_prefix} Final Generated Tests")
+        norm_tests = _normalize_newlines_for_display(wf_tests)
+        st.code(norm_tests, language="python")
         st.download_button(
-            label="Download workflow tests_generated.py",
-            data=_normalize_newlines_for_display(wf_tests),
-            file_name="workflow_tests_generated.py",
+            label=f"Download {title_prefix.lower()}_tests_generated.py",
+            data=norm_tests,
+            file_name=f"{title_prefix.lower()}_tests_generated.py",
             mime="text/x-python",
+            key=f"dl_tests_{title_prefix.lower()}_{hash(title_prefix)}",
         )
 
     # 4. Final Application Execution
-    _render_execution(wf.get("execution"), "Workflow Final Application Execution")
+    _render_execution(wf.get("execution"), f"{title_prefix} Final Application Execution")
 
     # 5. Final Test Execution
-    _render_execution(wf.get("test_execution"), "Workflow Final Test Execution")
+    _render_execution(wf.get("test_execution"), f"{title_prefix} Final Test Execution")
 
     # 6. Final Reviewer Report
     wf_review = wf.get("review")
     if wf_review:
-        with st.expander("Workflow Final Review"):
+        with st.expander(f"{title_prefix} Final Review"):
             st.metric("Overall Score", wf_review.get("overall_score", "N/A"))
             st.write("\n".join(wf_review.get("strengths", []) or []))
             st.write("\n".join(wf_review.get("recommendations", []) or []))
 
-    # 7. Iteration history
+    # 7. Documentation
+    wf_doc = wf.get("documentation")
+    if wf_doc:
+        with st.expander(f"{title_prefix} Generated Documentation"):
+            st.markdown(wf_doc.get("markdown_documentation", ""))
+
+    # 8. Iteration history
     iterations = wf.get("iterations") or []
     if iterations:
-        st.subheader("Debugging Iterations")
+        st.subheader(f"{title_prefix} Debugging Iterations")
         for iteration in iterations:
             iter_num = iteration.get("iteration_number", "?")
             iter_label = f"Iteration {iter_num}"
@@ -903,3 +935,206 @@ if st.session_state.workflow:
                         st.write(
                             f"Summary: {iter_debug.get('final_summary', '')}"
                         )
+
+
+if st.session_state.workflow:
+    _render_workflow_result(st.session_state.workflow, title_prefix="Workflow")
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous Workflow with Real-Time SSE Streaming
+# ---------------------------------------------------------------------------
+
+st.subheader("Run Asynchronous Workflow (Live Streaming)")
+st.caption(
+    "Submit an asynchronous background workflow and monitor real-time agent "
+    "progress via Server-Sent Events (SSE). The UI updates dynamically without blocking."
+)
+
+async_workflow_prompt = st.text_area(
+    "Asynchronous workflow request",
+    height=120,
+    placeholder="Create a Python function called multiply that takes two numbers and returns their product.",
+    key="async_wf_prompt",
+)
+
+if "async_job_id" not in st.session_state:
+    st.session_state.async_job_id = None
+if "async_workflow_status" not in st.session_state:
+    st.session_state.async_workflow_status = None
+if "async_progress_state" not in st.session_state:
+    st.session_state.async_progress_state = None
+if "async_workflow_result" not in st.session_state:
+    st.session_state.async_workflow_result = None
+if "async_event_log" not in st.session_state:
+    st.session_state.async_event_log = []
+
+col_async_btn, _ = st.columns([1, 4])
+with col_async_btn:
+    run_async_clicked = st.button("Run Async Workflow", type="primary")
+
+if run_async_clicked:
+    if not async_workflow_prompt.strip():
+        st.error("Prompt must not be empty")
+    else:
+        st.session_state.async_workflow_result = None
+        st.session_state.async_event_log = []
+        progress_state = WorkflowProgressState()
+        st.session_state.async_progress_state = progress_state
+
+        status_box = st.empty()
+        timeline_box = st.empty()
+        metrics_box = st.empty()
+        activity_box = st.empty()
+
+        status_box.info("Submitting asynchronous workflow job...")
+
+        try:
+            submit_resp = requests.post(
+                f"{BACKEND_URL}/workflow/jobs",
+                json={"prompt": async_workflow_prompt.strip()},
+                timeout=15,
+            )
+            if submit_resp.status_code != 202:
+                status_box.error(
+                    f"Job submission failed: {submit_resp.status_code} - "
+                    f"{sanitize_error_message(submit_resp.text)}"
+                )
+            else:
+                submit_data = submit_resp.json()
+                job_id = submit_data.get("job_id", "")
+                st.session_state.async_job_id = job_id
+                progress_state.job_id = job_id
+                progress_state.status = submit_data.get("status", "queued")
+                status_box.success(f"Job accepted! Job ID: `{job_id}`")
+
+                def _render_live_ui():
+                    timeline_box.markdown(format_progress_timeline(progress_state))
+                    m1, m2, m3, m4 = metrics_box.columns(4)
+                    m1.metric("Status", progress_state.status.title())
+                    m2.metric("Iteration", f"{progress_state.iteration} / {progress_state.max_iterations}")
+                    t_str = (
+                        f"{progress_state.tests_passed} pass / {progress_state.tests_failed} fail"
+                        if progress_state.tests_passed is not None
+                        else "Pending"
+                    )
+                    m3.metric("Tests", t_str)
+                    r_str = (
+                        f"{progress_state.reviewer_score}/100"
+                        if progress_state.reviewer_score is not None
+                        else "Pending"
+                    )
+                    m4.metric("Reviewer Score", r_str)
+
+                _render_live_ui()
+
+                # Stream from SSE
+                stream_url = f"{BACKEND_URL}/workflow/jobs/{job_id}/stream"
+                status_box.info(f"Connecting to live event stream: `{job_id}` ...")
+
+                sse_succeeded = False
+                try:
+                    with requests.get(stream_url, stream=True, timeout=300) as sse_resp:
+                        if sse_resp.status_code == 200:
+                            sse_succeeded = True
+                            status_box.info("Live stream connected. Tracking progress in real time...")
+                            for parsed_ev in iter_sse_events(sse_resp.iter_lines(decode_unicode=True)):
+                                ev_type = parsed_ev.event_type
+                                payload = (
+                                    parsed_ev.data.get("payload", {})
+                                    if isinstance(parsed_ev.data, dict)
+                                    else {}
+                                )
+                                log_msg = map_workflow_event(ev_type, payload, progress_state)
+                                timestamp_str = time.strftime("%H:%M:%S")
+                                st.session_state.async_event_log.append(f"[{timestamp_str}] {log_msg}")
+
+                                _render_live_ui()
+                                activity_box.caption(f"Latest activity: **{log_msg}**")
+
+                                if progress_state.is_terminal:
+                                    break
+                except Exception as sse_exc:
+                    logger.warning("SSE stream connection issue: %s", sse_exc)
+
+                # Fallback polling if SSE disconnected early or failed
+                if not progress_state.is_terminal:
+                    status_box.warning("Live stream disconnected. Polling background job status...")
+
+                    def _poll_cb(poll_data):
+                        st_name = poll_data.get("status", "running")
+                        progress_state.status = st_name
+                        status_box.info(f"Polling job status: **{st_name}** ...")
+                        _render_live_ui()
+
+                    poll_result = poll_workflow_job(
+                        BACKEND_URL,
+                        job_id,
+                        max_wait_seconds=180.0,
+                        poll_interval=1.5,
+                        on_poll_callback=_poll_cb,
+                    )
+                    if poll_result:
+                        p_status = poll_result.get("status")
+                        if p_status == "completed":
+                            progress_state.status = "completed"
+                            progress_state.is_terminal = True
+                        elif p_status in ("failed", "cancelled"):
+                            progress_state.status = "failed"
+                            progress_state.is_terminal = True
+                            progress_state.error = sanitize_error_message(
+                                poll_result.get("error", "Job failed")
+                            )
+
+                # Retrieve complete final job result
+                try:
+                    final_resp = requests.get(f"{BACKEND_URL}/workflow/jobs/{job_id}", timeout=15)
+                    if final_resp.status_code == 200:
+                        final_data = final_resp.json()
+                        st.session_state.async_workflow_status = final_data.get("status")
+                        st.session_state.async_workflow_result = final_data.get("result")
+                except Exception as final_exc:
+                    logger.error("Failed to retrieve final job result: %s", final_exc)
+
+                _render_live_ui()
+                if progress_state.status == "completed":
+                    status_box.success("Asynchronous workflow completed successfully!")
+                else:
+                    status_box.error(
+                        f"Asynchronous workflow failed: {progress_state.error or 'Execution failed'}"
+                    )
+        except Exception as exc:
+            st.error(f"Error executing asynchronous workflow: {sanitize_error_message(str(exc))}")
+
+# Render active state and final results on reruns
+if st.session_state.async_progress_state and not run_async_clicked:
+    p_state = st.session_state.async_progress_state
+    st.markdown("#### Workflow Timeline")
+    st.markdown(format_progress_timeline(p_state))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Status", p_state.status.title())
+    m2.metric("Iteration", f"{p_state.iteration} / {p_state.max_iterations}")
+    t_str = (
+        f"{p_state.tests_passed} pass / {p_state.tests_failed} fail"
+        if p_state.tests_passed is not None
+        else "Pending"
+    )
+    m3.metric("Tests", t_str)
+    r_str = (
+        f"{p_state.reviewer_score}/100"
+        if p_state.reviewer_score is not None
+        else "Pending"
+    )
+    m4.metric("Reviewer Score", r_str)
+
+if st.session_state.async_event_log:
+    with st.expander("Live Workflow Event Log", expanded=False):
+        for log_entry in st.session_state.async_event_log:
+            st.write(log_entry)
+
+if st.session_state.async_workflow_result:
+    _render_workflow_result(
+        st.session_state.async_workflow_result,
+        title_prefix="Asynchronous Workflow",
+    )
