@@ -93,6 +93,7 @@ router = APIRouter()
 
 class GenerateCodePayload(BaseModel):
     prompt: str = Field(..., min_length=1)
+    language: str | None = Field(default=None)
 
 
 class GenerateCodeResponse(BaseModel):
@@ -252,7 +253,9 @@ def generate_code(
     logger.info("POST /generate-code: request received")
     try:
         logger.info("POST /generate-code: use-case started")
-        result = use_case.execute(GenerateCodeRequest(prompt=prompt))
+        result = use_case.execute(
+            GenerateCodeRequest(prompt=prompt, language=payload.language)
+        )
         logger.info("POST /generate-code: use-case finished")
         return GenerateCodeResponse(success=True, generated_code=result.generated_code)
     except ValueError as exc:
@@ -614,6 +617,7 @@ class RunWorkflowPayload(BaseModel):
     prompt: str = Field(..., min_length=1)
     repository_root: str | None = None
     apply_repository_changes: bool = False
+    language: str | None = None
 
 
 class WorkflowExecutionModel(BaseModel):
@@ -710,6 +714,7 @@ def run_workflow(
                 prompt=prompt,
                 repository_root=(payload.repository_root or None),
                 apply_repository_changes=payload.apply_repository_changes,
+                language=payload.language,
             )
         )
         logger.info("POST /run-workflow: use-case finished")
@@ -1348,6 +1353,7 @@ def _execute_workflow_job_task(
             apply_repository_changes=payload.apply_repository_changes,
             job_id=j_id,
             event_emitter=emitter,
+            language=payload.language,
         )
         wf_result = workflow_use_case.execute(request)
         return serialize_workflow_result(wf_result)
@@ -1384,6 +1390,7 @@ def create_workflow_job(
             "prompt_length": len(prompt),
             "repository_root": payload.repository_root,
             "apply_repository_changes": payload.apply_repository_changes,
+            "language": payload.language,
         }
     )
 

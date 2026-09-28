@@ -21,6 +21,7 @@ class CreateWorkflowJobPayload(BaseModel):
     prompt: str = Field(..., description="Task prompt for the multi-agent workflow")
     repository_root: str | None = Field(default=None, description="Optional root directory of the repository")
     apply_repository_changes: bool = Field(default=False, description="Whether to apply repository changes directly")
+    language: str | None = Field(default=None, description="Optional requested programming language")
 
 
 class CreateJobResponse(BaseModel):

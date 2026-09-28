@@ -21,6 +21,13 @@ from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List
 
 from backend.infrastructure.llm_client import LLMClient
+from agents.language_support import (
+    build_coder_system_prompt,
+    extract_programming_language,
+    get_language_display_name,
+    normalize_language,
+    validate_code_language,
+)
 
 from backend.domain.change_models import (
     ChangeOperation,
@@ -145,16 +152,22 @@ class CoderAgent:
         prompt: str,
         *,
         retrieved_context: str | None = None,
+        language: str | None = None,
+        max_attempts: int = 2,
     ) -> str:
-        """Generate Python code.
+        """Generate code in the requested programming language.
 
         Args:
             prompt: Natural language programming request.
             retrieved_context: Optional repository context (pre-formatted by
                 the RAG layer). Agents never retrieve context internally.
+            language: Optional explicit programming language (e.g., 'java', 'python').
+                If omitted or 'auto', language is extracted from the prompt.
+                Defaults to Python if unspecified.
+            max_attempts: Maximum generation attempts before failing on validation error.
 
         Returns:
-            Python code only (no Markdown fences).
+            Source code only (no Markdown fences).
         """
 
         if not isinstance(prompt, str):
@@ -162,28 +175,64 @@ class CoderAgent:
         if not prompt.strip():
             raise ValueError("prompt must be non-empty")
 
+        user_content = prompt
         if retrieved_context:
-            prompt = f"{retrieved_context}\n\n---\n\nUser request:\n{prompt}"
+            user_content = f"{retrieved_context}\n\n---\n\nUser request:\n{prompt}"
 
-        system_prompt = (
-            "You are a senior Python software engineer. "
-            "Generate production-quality Python code that satisfies the request. "
-            "Return ONLY the raw Python source code. "
-            "Do NOT include Markdown code fences, explanations, or comments outside "
-            "the code. If you must include comments, include them inside the code." 
-        )
+        target_lang = normalize_language(language) or extract_programming_language(prompt) or "python"
+        display_name = get_language_display_name(target_lang)
+        system_prompt = build_coder_system_prompt(target_lang)
 
-        logger.info("CoderAgent: generating code")
-        response = self.llm_client.generate(prompt, system_prompt=system_prompt)
-        code = response.text
+        current_prompt = user_content
+        attempts = 0
+        last_failure_reason: str | None = None
 
-        cleaned = _strip_markdown_code_fences(code).strip()
-        if not cleaned or "def " not in cleaned and "import " not in cleaned:
-            # Heuristic: still allow small snippets; keep it lenient.
+        while attempts < max_attempts:
+            attempts += 1
+            logger.info(
+                "CoderAgent: generating code (attempt %d/%d, language: %s)",
+                attempts,
+                max_attempts,
+                display_name,
+            )
+            response = self.llm_client.generate(current_prompt, system_prompt=system_prompt)
+            code = response.text or ""
+            cleaned = _strip_markdown_code_fences(code).strip()
+
             if len(cleaned) < 10:
-                raise CoderAgentError("LLM returned invalid/too-short code")
+                last_failure_reason = "LLM returned invalid/too-short code"
+                current_prompt = (
+                    f"{user_content}\n\n"
+                    f"[SYSTEM NOTICE: The previous output was too short or empty. "
+                    f"Generate complete, valid {display_name} code to solve the request.]"
+                )
+                continue
 
-        return cleaned
+            # Validate language
+            is_valid, reason = validate_code_language(cleaned, target_lang)
+            if not is_valid:
+                logger.warning(
+                    "CoderAgent: language validation failed for %s on attempt %d: %s",
+                    display_name,
+                    attempts,
+                    reason,
+                )
+                last_failure_reason = reason
+                current_prompt = (
+                    f"{user_content}\n\n"
+                    f"[CRITICAL ERROR - LANGUAGE MISMATCH]\n"
+                    f"Your previous attempt generated the wrong language: {reason}\n"
+                    f"You MUST generate ONLY {display_name} code.\n"
+                    f"Do NOT output Python, Java, or any other programming language.\n"
+                    f"Keep the code concise, focused, and proportional to the task."
+                )
+                continue
+
+            return cleaned
+
+        raise CoderAgentError(
+            f"Failed to generate valid {display_name} code after {max_attempts} attempts: {last_failure_reason}"
+        )
 
     # ------------------------------------------------------------------ #
     # generate_changes helpers

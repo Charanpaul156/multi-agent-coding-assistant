@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator
@@ -50,6 +52,20 @@ STATUS_ICONS: dict[str, str] = {
     "failed": "❌",
     "skipped": "➖",
 }
+
+STAGE_DEFINITIONS: tuple[tuple[str, str], ...] = (
+    ("job_queued", "Job Queued"),
+    ("workflow_started", "Workflow Started"),
+    ("planner", "Planner"),
+    ("coder", "Coder"),
+    ("test_generator", "Test Generator"),
+    ("executor", "Application Executor"),
+    ("test_executor", "Test Executor"),
+    ("reviewer", "Reviewer"),
+    ("debugger", "Debugger"),
+    ("documentation", "Documentation"),
+    ("workflow_terminal", "Workflow Completed"),
+)
 
 FORBIDDEN_PATTERNS = (
     "approval_token",
@@ -90,6 +106,8 @@ class WorkflowProgressState:
     is_terminal: bool = False
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    start_time: float | None = None
+    elapsed_seconds: float = 0.0
 
 
 def parse_sse_event(block: str) -> ParsedSSEEvent | None:
@@ -161,16 +179,40 @@ def iter_sse_events(lines_iterator: Iterable[str | bytes]) -> Iterator[ParsedSSE
             yield parsed
 
 
+def sanitize_display_text(text: str) -> str:
+    """Ensure no tokens, keys, credentials, or internal tracebacks leak to the UI."""
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"(approval_token|ticket_token|token|secret|key|credential|api_key|password)\s*[:=]\s*['\"][^'\"]+['\"]",
+        r"\1=[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(Bearer\s+)[A-Za-z0-9_\-\.]+",
+        r"\1[REDACTED]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(AIza[0-9A-Za-z-_]{35})",
+        r"[REDACTED_API_KEY]",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r'File ".*?", line \d+, in .*',
+        "",
+        cleaned,
+    )
+    return cleaned.strip()
+
+
 def sanitize_error_message(error: str) -> str:
     """Sanitize error messages to ensure no tokens, keys, or stack traces leak."""
     if not error:
         return ""
-    # Strip potential token key-value pairs or tokens
-    cleaned = re.sub(r"(token|secret|key|credential)=['\"][^'\"]+['\"]", r"\1=[REDACTED]", error, flags=re.IGNORECASE)
-    cleaned = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED]", cleaned, flags=re.IGNORECASE)
-    # Strip internal file paths
-    cleaned = re.sub(r'File ".*?", line \d+, in .*', "", cleaned)
-    # Limit to concise single line
+    cleaned = sanitize_display_text(error)
     first_line = cleaned.strip().split("\n")[0]
     return first_line.strip() or "Workflow encountered an error"
 
@@ -182,6 +224,12 @@ def map_workflow_event(
 ) -> str:
     """Map an incoming backend event into human-readable text and update progress state."""
     state.events.append({"event_type": event_type, "payload": payload, "time": time.time()})
+
+    if state.start_time is None and event_type in ("workflow_started", "step_start"):
+        state.start_time = time.monotonic()
+
+    if state.start_time is not None:
+        state.elapsed_seconds = round(time.monotonic() - state.start_time, 1)
 
     if event_type == "workflow_started":
         state.status = "running"
@@ -263,6 +311,225 @@ def format_progress_timeline(state: WorkflowProgressState) -> str:
         else:
             lines.append(f"{icon} {label}")
     return "\n\n".join(lines)
+
+
+def get_timeline_stages(state: WorkflowProgressState) -> list[dict[str, Any]]:
+    """Return a visual timeline representation of recognizable workflow stages."""
+    stages: list[dict[str, Any]] = []
+
+    # 1. Job Queued
+    queued_status = "completed" if (state.job_id or state.status != "pending") else "pending"
+    stages.append({
+        "id": "job_queued",
+        "label": "Job Queued",
+        "status": queued_status,
+        "detail": f"ID: {state.job_id[:12]}..." if len(state.job_id) > 12 else (state.job_id or ""),
+    })
+
+    # 2. Workflow Started
+    if state.status in ("running", "completed", "failed"):
+        started_status = "completed"
+    elif state.status == "queued":
+        started_status = "pending"
+    else:
+        started_status = "pending"
+    stages.append({
+        "id": "workflow_started",
+        "label": "Workflow Started",
+        "status": started_status,
+        "detail": f"Iteration {state.iteration}/{state.max_iterations}" if started_status == "completed" else "",
+    })
+
+    # Pipeline steps
+    for step_id in PIPELINE_STEPS:
+        st_val = state.step_states.get(step_id, "pending")
+        label = STEP_LABELS.get(step_id, step_id.title())
+        detail = ""
+        if step_id == "test_executor" and state.tests_passed is not None:
+            detail = f"{state.tests_passed} passed / {state.tests_failed or 0} failed"
+        elif step_id == "reviewer" and state.reviewer_score is not None:
+            detail = f"Score: {state.reviewer_score}/100"
+        elif step_id == "debugger" and st_val == "pending" and state.status == "completed":
+            st_val = "skipped"
+            detail = "No defects detected"
+
+        stages.append({
+            "id": step_id,
+            "label": label,
+            "status": st_val,
+            "detail": detail,
+        })
+
+    # Final stage
+    if state.status == "completed":
+        final_status = "completed"
+        final_label = "Workflow Completed"
+    elif state.status == "failed":
+        final_status = "failed"
+        final_label = f"Workflow Failed: {state.error or 'Execution Error'}"
+    else:
+        final_status = "pending"
+        final_label = "Workflow Completion"
+
+    stages.append({
+        "id": "workflow_terminal",
+        "label": final_label,
+        "status": final_status,
+        "detail": "",
+    })
+
+    return stages
+
+
+def get_repository_info(repo_path: str | None) -> dict[str, Any]:
+    """Inspect local repository path for existence and git branch information."""
+    if not repo_path or not str(repo_path).strip():
+        return {
+            "valid": False,
+            "exists": False,
+            "is_dir": False,
+            "is_git": False,
+            "branch": None,
+            "name": "",
+            "error": "Repository path not specified",
+        }
+
+    clean_path = os.path.abspath(str(repo_path).strip())
+    if not os.path.exists(clean_path):
+        return {
+            "valid": False,
+            "exists": False,
+            "is_dir": False,
+            "is_git": False,
+            "branch": None,
+            "name": os.path.basename(clean_path),
+            "error": f"Path does not exist: {clean_path}",
+        }
+
+    if not os.path.isdir(clean_path):
+        return {
+            "valid": False,
+            "exists": True,
+            "is_dir": False,
+            "is_git": False,
+            "branch": None,
+            "name": os.path.basename(clean_path),
+            "error": "Path is not a directory",
+        }
+
+    git_dir = os.path.join(clean_path, ".git")
+    is_git = os.path.exists(git_dir)
+    branch = None
+
+    if is_git:
+        try:
+            head_file = os.path.join(git_dir, "HEAD") if os.path.isdir(git_dir) else None
+            if head_file and os.path.exists(head_file):
+                with open(head_file, "r", encoding="utf-8") as f:
+                    head_content = f.read().strip()
+                if head_content.startswith("ref: refs/heads/"):
+                    branch = head_content[len("ref: refs/heads/"):]
+                elif len(head_content) >= 7:
+                    branch = head_content[:7]
+        except Exception:
+            branch = None
+
+        if not branch:
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", clean_path, "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if proc.returncode == 0:
+                    branch = proc.stdout.strip()
+            except Exception:
+                pass
+
+    return {
+        "valid": True,
+        "exists": True,
+        "is_dir": True,
+        "is_git": is_git,
+        "branch": branch,
+        "name": os.path.basename(clean_path),
+        "error": None,
+    }
+
+
+def check_backend_health(base_url: str = "http://localhost:8000", timeout: float = 0.5) -> dict[str, Any]:
+    """Check connectivity and health of the assistant backend API."""
+    url = f"{base_url.rstrip('/')}/health"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"status": resp.text.strip()}
+            return {"connected": True, "status": data.get("status", "ok"), "url": base_url, "error": None}
+        return {
+            "connected": False,
+            "status": f"HTTP {resp.status_code}",
+            "url": base_url,
+            "error": f"Server returned status {resp.status_code}",
+        }
+    except Exception as exc:
+        return {
+            "connected": False,
+            "status": "offline",
+            "url": base_url,
+            "error": sanitize_error_message(str(exc)),
+        }
+
+
+def format_elapsed_time(seconds: float | None) -> str:
+    """Format elapsed seconds into a readable string."""
+    if seconds is None or seconds < 0:
+        return "0.0s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem_seconds = seconds % 60
+    return f"{minutes}m {rem_seconds:.1f}s"
+
+
+def summarize_prompt(prompt: str, max_chars: int = 60) -> str:
+    """Return a single-line concise summary of a prompt."""
+    if not prompt:
+        return ""
+    clean = re.sub(r"\s+", " ", prompt).strip()
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def record_recent_run(
+    runs: list[dict[str, Any]],
+    run_data: dict[str, Any],
+    max_runs: int = 10,
+) -> list[dict[str, Any]]:
+    """Record or update a workflow run in the recent runs session history."""
+    if not isinstance(run_data, dict):
+        return runs
+
+    job_id = run_data.get("job_id")
+    updated = False
+    new_runs: list[dict[str, Any]] = []
+
+    for r in runs:
+        if job_id and r.get("job_id") == job_id:
+            merged = {**r, **run_data}
+            new_runs.append(merged)
+            updated = True
+        else:
+            new_runs.append(r)
+
+    if not updated:
+        new_runs.insert(0, run_data)
+
+    return new_runs[:max_runs]
 
 
 def poll_workflow_job(

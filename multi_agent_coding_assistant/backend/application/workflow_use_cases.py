@@ -105,6 +105,7 @@ class WorkflowRequest:
     apply_repository_changes: bool = False
     job_id: Optional[str] = None
     event_emitter: Optional[EventEmitter] = None
+    language: Optional[str] = None
 
 
 @dataclass
@@ -337,7 +338,10 @@ class RunWorkflowUseCase:
         self._emit(emitter, job_id, "step_start", {"step": "coder"})
         try:
             code_result: GenerateCodeResult = self._coder_use_case.execute(
-                GenerateCodeRequest(prompt=request.prompt)
+                GenerateCodeRequest(
+                    prompt=request.prompt,
+                    language=request.language,
+                )
             )
             current_code = code_result.generated_code
             logger.info("Coder Finished")

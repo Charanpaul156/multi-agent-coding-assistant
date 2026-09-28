@@ -20,6 +20,7 @@ class GenerateCodeRequest:
 
     prompt: str
     retrieved_context: str | None = None
+    language: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class GenerateCodeResult:
 
 
 class GenerateCodeUseCase:
-    """Use-case: generate Python code from a natural language prompt."""
+    """Use-case: generate code in the requested programming language from a prompt."""
 
     def __init__(self, coder_agent: CoderAgent) -> None:
         self._coder_agent = coder_agent
@@ -47,7 +48,7 @@ class GenerateCodeUseCase:
         code = self._coder_agent.generate_code(
             request.prompt,
             retrieved_context=request.retrieved_context,
+            language=request.language,
         )
         logger.info("GenerateCodeUseCase: finished")
         return GenerateCodeResult(generated_code=code)
-
