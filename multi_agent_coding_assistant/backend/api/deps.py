@@ -35,6 +35,9 @@ from backend.application.rag_use_cases import (
     IndexRepositoryUseCase,
     SearchRepositoryUseCase,
 )
+from backend.application.job_manager import JobManager
+from backend.application.job_runner import JobRunner
+from backend.infrastructure.event_bus import EventBus
 from backend.application.modify_repository_use_cases import ModifyRepositoryUseCase
 from backend.infrastructure.approval_store import ApprovalStore
 from backend.infrastructure.change_applier import ChangeApplier
@@ -169,6 +172,7 @@ def get_run_workflow_use_case() -> RunWorkflowUseCase:
         repository_modify_use_case=get_modify_repository_use_case(),
         repository_debugger_agent=get_debugger_agent(),
         documentation_use_case=get_generate_documentation_use_case(),
+        event_emitter=get_event_bus(),
         max_iterations=get_settings().max_iterations,
     )
 
@@ -272,7 +276,34 @@ def get_modify_repository_use_case() -> ModifyRepositoryUseCase:
         review_use_case=get_review_code_use_case(),
         debugger_agent=get_debugger_agent(),
         approval_store=get_approval_store(),
+        event_emitter=get_event_bus(),
         max_iterations=get_settings().max_iterations,
     )
 
 
+# ---------------------------------------------------------------------------
+# Asynchronous Job & Event Bus wiring
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def get_event_bus() -> EventBus:
+    """Provide the application singleton EventBus for event pub/sub."""
+    return EventBus()
+
+
+@lru_cache(maxsize=1)
+def get_job_manager() -> JobManager:
+    """Provide the application singleton JobManager for workflow job tracking."""
+    return JobManager()
+
+
+@lru_cache(maxsize=1)
+def get_job_runner() -> JobRunner:
+    """Provide the application JobRunner, sharing singleton JobManager and EventBus."""
+    bus = get_event_bus()
+    return JobRunner(
+        job_manager=get_job_manager(),
+        event_bus=bus,
+        event_emitter=bus,
+    )

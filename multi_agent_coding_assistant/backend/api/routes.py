@@ -6,27 +6,45 @@ Business logic must remain in the application layer.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.api.deps import (
     get_debug_code_use_case,
     get_coder_agent,
+    get_event_bus,
     get_execute_code_use_case,
     get_generate_code_use_case,
     get_generate_documentation_use_case,
     get_generate_plan_use_case,
     get_generate_tests_use_case,
     get_index_repository_use_case,
+    get_job_manager,
+    get_job_runner,
     get_modify_repository_use_case,
     get_rag_status_use_case,
     get_review_code_use_case,
     get_run_workflow_use_case,
     get_search_repository_use_case,
 )
+from backend.api.job_schemas import (
+    CreateJobResponse,
+    CreateWorkflowJobPayload,
+    JobStatusApiResponse,
+    serialize_workflow_result,
+)
+from backend.application.event_emitter import EventEmitter
+from backend.application.job_manager import JobManager
+from backend.application.job_runner import JobRunner
+from backend.domain.job_models import JobStatus, WorkflowEvent, WorkflowJob
+from backend.infrastructure.event_bus import EventBus
 from backend.application.use_cases import GenerateCodeRequest, GenerateCodeUseCase
 from backend.application.debugging_use_cases import (
     DebugCodeRequest,
@@ -1309,3 +1327,246 @@ def reject_repository_modification(
         raise HTTPException(
             status_code=500, detail=f"Rejection failed: {exc}"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous Workflow Job endpoints
+# ---------------------------------------------------------------------------
+
+
+def _execute_workflow_job_task(
+    runner: JobRunner,
+    workflow_use_case: RunWorkflowUseCase,
+    job_id: str,
+    payload: CreateWorkflowJobPayload,
+) -> None:
+    """Execute a background workflow job via the application JobRunner."""
+    def _task(j_id: str, emitter: EventEmitter | None) -> Any:
+        request = WorkflowRequest(
+            prompt=payload.prompt,
+            repository_root=payload.repository_root,
+            apply_repository_changes=payload.apply_repository_changes,
+            job_id=j_id,
+            event_emitter=emitter,
+        )
+        wf_result = workflow_use_case.execute(request)
+        return serialize_workflow_result(wf_result)
+
+    runner.run_job(_task, job_id=job_id)
+
+
+@router.post(
+    "/workflow/jobs",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["jobs"],
+)
+def create_workflow_job(
+    payload: CreateWorkflowJobPayload,
+    background_tasks: BackgroundTasks,
+    job_runner: JobRunner = Depends(get_job_runner),
+    workflow_use_case: RunWorkflowUseCase = Depends(get_run_workflow_use_case),
+) -> CreateJobResponse:
+    """Submit an asynchronous multi-agent workflow job.
+
+    Returns HTTP 202 Accepted immediately with initial status 'queued'.
+    The workflow executes in the background, updating status to 'running'
+    and eventually 'completed' or 'failed'.
+    """
+    prompt = (payload.prompt or "").strip()
+    if not prompt:
+        logger.warning("POST /workflow/jobs: empty prompt")
+        raise HTTPException(status_code=400, detail="prompt must not be empty")
+
+    logger.info("POST /workflow/jobs: creating background job")
+    job = job_runner.create_job(
+        metadata={
+            "prompt_length": len(prompt),
+            "repository_root": payload.repository_root,
+            "apply_repository_changes": payload.apply_repository_changes,
+        }
+    )
+
+    background_tasks.add_task(
+        _execute_workflow_job_task,
+        job_runner,
+        workflow_use_case,
+        job.job_id,
+        payload,
+    )
+
+    return CreateJobResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+    )
+
+
+@router.get(
+    "/workflow/jobs/{job_id}",
+    response_model=JobStatusApiResponse,
+    tags=["jobs"],
+)
+def get_workflow_job_status(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+) -> JobStatusApiResponse:
+    """Retrieve the current lifecycle status and result of a workflow job."""
+    cleaned_id = (job_id or "").strip()
+    if not cleaned_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_manager.get_job(cleaned_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {cleaned_id}")
+
+    result_data = serialize_workflow_result(job.result) if job.result is not None else None
+
+    return JobStatusApiResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        result=result_data,
+        error=job.error,
+        metadata=dict(job.metadata),
+    )
+
+
+_TERMINAL_EVENT_TYPES = frozenset(
+    {"job_completed", "job_failed", "workflow_failed", "workflow_completed"}
+)
+
+
+def _format_sse_event(event: WorkflowEvent) -> str:
+    """Serialize a WorkflowEvent to standard SSE wire format ending with double newline."""
+    payload_dict = event.to_dict()
+    # Defense-in-depth: ensure no approval tokens or credentials leak in event stream
+    if isinstance(payload_dict.get("payload"), dict):
+        sanitized_payload = {
+            k: v
+            for k, v in payload_dict["payload"].items()
+            if k not in {"approval_token", "ticket_token", "token"}
+        }
+        payload_dict["payload"] = sanitized_payload
+    data_str = json.dumps(payload_dict, ensure_ascii=False)
+    return f"event: {event.event_type}\ndata: {data_str}\n\n"
+
+
+def _create_terminal_event(job: WorkflowJob) -> WorkflowEvent:
+    """Create a terminal completion or failure event from a finished job entity."""
+    if job.status == JobStatus.COMPLETED:
+        return WorkflowEvent(
+            event_type="job_completed",
+            job_id=job.job_id,
+            timestamp=job.completed_at or datetime.now(timezone.utc),
+            payload={"job_id": job.job_id, "status": "completed"},
+        )
+    error_msg = job.error or f"Workflow {job.status.value}"
+    return WorkflowEvent(
+        event_type="job_failed",
+        job_id=job.job_id,
+        timestamp=job.completed_at or datetime.now(timezone.utc),
+        payload={"job_id": job.job_id, "status": job.status.value, "error": error_msg},
+    )
+
+
+@router.get(
+    "/workflow/jobs/{job_id}/stream",
+    tags=["jobs"],
+    response_class=StreamingResponse,
+)
+async def stream_workflow_events(
+    job_id: str,
+    request: Request,
+    job_manager: JobManager = Depends(get_job_manager),
+    event_bus: EventBus = Depends(get_event_bus),
+) -> StreamingResponse:
+    """Stream real-time workflow progress events via Server-Sent Events (SSE).
+
+    Subscribes to the application EventBus for the given job_id and yields
+    standard text/event-stream messages. Cleanly closes when the job completes,
+    fails, or when the client disconnects.
+    """
+    cleaned_id = (job_id or "").strip()
+    if not cleaned_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_manager.get_job(cleaned_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {cleaned_id}")
+
+    sse_headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    # If the job is already terminal when client connects, send final state and close
+    if job.status.is_terminal:
+        async def terminal_event_stream() -> AsyncIterator[str]:
+            yield _format_sse_event(_create_terminal_event(job))
+
+        return StreamingResponse(
+            terminal_event_stream(),
+            media_type="text/event-stream",
+            headers=sse_headers,
+        )
+
+    subscription = event_bus.subscribe(cleaned_id)
+
+    # Re-check in case the job transitioned to terminal right before subscription registered
+    job_after_sub = job_manager.get_job(cleaned_id)
+    if job_after_sub and job_after_sub.status.is_terminal:
+        subscription.close()
+
+        async def terminal_after_sub_stream() -> AsyncIterator[str]:
+            yield _format_sse_event(_create_terminal_event(job_after_sub))
+
+        return StreamingResponse(
+            terminal_after_sub_stream(),
+            media_type="text/event-stream",
+            headers=sse_headers,
+        )
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.debug("SSE client disconnected for job %s", cleaned_id)
+                    break
+
+                try:
+                    event = await subscription.get(timeout=15.0)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    # Verify if job reached a terminal state in JobManager while waiting
+                    curr_job = job_manager.get_job(cleaned_id)
+                    if curr_job and curr_job.status.is_terminal:
+                        yield _format_sse_event(_create_terminal_event(curr_job))
+                        break
+                    yield ": keep-alive\n\n"
+                    continue
+
+                if event is None:
+                    # Completion sentinel received from EventBus
+                    break
+
+                yield _format_sse_event(event)
+
+                if event.event_type in _TERMINAL_EVENT_TYPES:
+                    break
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.debug("SSE connection closed for job %s", cleaned_id)
+            raise
+        except Exception as exc:
+            logger.warning("Error in SSE event stream for job %s: %s", cleaned_id, exc)
+        finally:
+            subscription.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers=sse_headers,
+    )
