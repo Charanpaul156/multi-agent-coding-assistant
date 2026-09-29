@@ -692,7 +692,16 @@ class RunWorkflowUseCase:
             clean_error = _sanitize_error(str(exc))
             if any(
                 term in clean_error.lower()
-                for term in ["json", "decode", "parse", "unterminated", "truncate"]
+                for term in [
+                    "json",
+                    "decode",
+                    "parse",
+                    "unterminated",
+                    "truncate",
+                    "structured",
+                    "output budget",
+                    "json_validate_failed",
+                ]
             ):
                 user_msg = (
                     "Repository coding could not parse the AI-generated change set. "

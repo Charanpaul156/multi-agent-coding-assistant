@@ -20,7 +20,11 @@ import re
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List
 
-from backend.infrastructure.llm_client import LLMClient, _sanitize_error
+from backend.infrastructure.llm_client import (
+    LLMClient,
+    LLMStructuredOutputError,
+    _sanitize_error,
+)
 from agents.language_support import (
     build_coder_system_prompt,
     extract_programming_language,
@@ -130,12 +134,53 @@ class CoderAgent:
                 attempt,
                 max_attempts,
             )
-            raw_text = self._call_llm(
-                current_prompt,
-                system_prompt,
-                response_format="json",
-                max_tokens=8192,
-            )
+            try:
+                raw_text = self._call_llm(
+                    current_prompt,
+                    system_prompt,
+                    response_format="json",
+                    max_tokens=8192,
+                )
+            except (LLMStructuredOutputError, CoderAgentError) as exc:
+                err_str = str(exc)
+                clean_err = _sanitize_error(err_str)
+                is_structured_failure = (
+                    isinstance(exc, LLMStructuredOutputError)
+                    or "json_validate_failed" in err_str.lower()
+                    or "structured json" in err_str.lower()
+                )
+                if not is_structured_failure:
+                    raise
+
+                last_error = clean_err
+                logger.warning(
+                    "Repository coding provider rejected structured output (attempt %d/%d): %s. "
+                    "The assistant will retry with stricter constraints.",
+                    attempt,
+                    max_attempts,
+                    clean_err,
+                )
+
+                if attempt >= max_attempts:
+                    logger.exception(
+                        "CoderAgent: structured output retry failed after %d attempts",
+                        max_attempts,
+                    )
+                    raise CoderAgentError(
+                        "Repository coding could not generate valid structured JSON within the output budget. "
+                        "The change request may be too large. Please request changes in smaller batches."
+                    ) from exc
+
+                current_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"[CORRECTION REQUIRED - STRUCTURED OUTPUT GENERATION FAILED]\n"
+                    f"The provider rejected the previous generation because the JSON could not be produced within the output budget.\n\n"
+                    f"Return ONLY a valid JSON object matching the ChangeSet schema.\n"
+                    f"Do not truncate file contents.\n"
+                    f"Keep the ChangeSet within the requested output budget.\n"
+                    f"Do not add explanations or Markdown fences."
+                )
+                continue
 
             try:
                 data = self._parse_json(raw_text)
@@ -332,7 +377,7 @@ class CoderAgent:
             # Fallback if injected fake client only accepts (prompt, system_prompt=...)
             response = self.llm_client.generate(prompt, system_prompt=system_prompt)
             return (response.text or "").strip()
-        except CoderAgentError:
+        except (CoderAgentError, LLMStructuredOutputError):
             raise
         except Exception as exc:
             sanitized = _sanitize_error(str(exc))
@@ -364,6 +409,11 @@ class CoderAgent:
         """Safely parse JSON from LLM response, detecting malformed or truncated payloads."""
         if not isinstance(text, str) or not text.strip():
             raise CoderAgentError("Empty response from LLM; expected a JSON ChangeSet.")
+
+        if len(text) > 5 * 1024 * 1024:
+            raise CoderAgentError(
+                "Response exceeds maximum size limit (5MB). Please request changes in smaller batches."
+            )
 
         cleaned = _strip_markdown_code_fences(text).strip()
 

@@ -13,7 +13,7 @@ import pytest
 from agents.coder_agent import CoderAgent, CoderAgentError
 from agents.planner_agent import ImplementationPlan
 from backend.domain.change_models import ChangeOperation, ChangeSet, FileChange
-from backend.infrastructure.llm_client import LLMResponse
+from backend.infrastructure.llm_client import LLMResponse, LLMStructuredOutputError
 
 
 def _valid_changes_json() -> dict:
@@ -86,7 +86,10 @@ class _FakeLLMClient:
             raise self.exc
         if not self.responses:
             raise AssertionError("No more LLM responses configured")
-        return LLMResponse(text=self.responses.pop(0))
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return LLMResponse(text=item)
 
 
 def _build_agent(client) -> CoderAgent:
@@ -332,3 +335,55 @@ def test_generate_changes_requests_structured_output() -> None:
     assert len(client.kwargs_list) == 1
     assert client.kwargs_list[0].get("response_format") == "json"
     assert client.kwargs_list[0].get("max_tokens") == 8192
+
+
+def test_generate_changes_retries_on_structured_output_failure() -> None:
+    # First call: structured output generation fails (e.g. Groq json_validate_failed)
+    # Second call: valid JSON ChangeSet
+    client = _FakeLLMClient(
+        responses=[
+            LLMStructuredOutputError("Provider failed structured output (code: json_validate_failed)"),
+            json.dumps(_create_only_json()),
+        ]
+    )
+    agent = _build_agent(client)
+
+    changes = agent.generate_changes("Create a file", max_attempts=2)
+    assert isinstance(changes, ChangeSet)
+    assert len(changes.changes) == 1
+    assert client.calls == 2
+    assert "[CORRECTION REQUIRED - STRUCTURED OUTPUT GENERATION FAILED]" in client.prompts[1]
+    assert "output budget" in client.prompts[1]
+
+
+def test_generate_changes_fails_after_max_retries_on_structured_output_failure() -> None:
+    client = _FakeLLMClient(
+        responses=[
+            LLMStructuredOutputError("Provider failed structured output (code: json_validate_failed)"),
+            LLMStructuredOutputError("Provider failed structured output (code: json_validate_failed)"),
+        ]
+    )
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError) as exc_info:
+        agent.generate_changes("Build a huge website", max_attempts=2)
+
+    assert client.calls == 2
+    err_msg = str(exc_info.value).lower()
+    assert "output budget" in err_msg or "smaller batches" in err_msg
+
+
+def test_generate_changes_structured_output_error_sanitizes_secrets() -> None:
+    secret = "gsk_1234567890abcdef1234567890abcdef"
+    client = _FakeLLMClient(
+        responses=[
+            LLMStructuredOutputError(f"Provider failed with key {secret}"),
+            LLMStructuredOutputError(f"Provider failed with key {secret}"),
+        ]
+    )
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError) as exc_info:
+        agent.generate_changes("Build something", max_attempts=2)
+
+    assert secret not in str(exc_info.value)

@@ -57,6 +57,10 @@ class LLMConfigurationError(LLMClientError):
     """Raised when required configuration is missing or invalid."""
 
 
+class LLMStructuredOutputError(LLMClientError):
+    """Raised when the LLM provider fails to generate or validate requested structured output."""
+
+
 class LLMTransientError(LLMClientError):
     """Raised for transient/network/5xx-like failures eligible for retry."""
 
@@ -274,29 +278,68 @@ class LLMClient:
 
             completion = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
-            msg = _sanitize_error(str(exc), self._api_key)
-            lower_msg = msg.lower()
+            raw_msg = str(exc)
+            status_code = getattr(exc, "status_code", None)
+            body = getattr(exc, "body", None)
+            error_code = None
+            if isinstance(body, dict):
+                err_dict = body.get("error")
+                if isinstance(err_dict, dict):
+                    error_code = err_dict.get("code")
 
-            # Check for authentication / invalid API key
+            # Avoid leaking massive failed_generation payloads into logs or error strings
+            if len(raw_msg) > 500:
+                if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                    err_message = body["error"].get("message")
+                    if err_message:
+                        raw_msg = f"Error code: {status_code or 400} - {err_message}"
+                    else:
+                        raw_msg = raw_msg[:500] + "... [truncated]"
+                else:
+                    raw_msg = raw_msg[:500] + "... [truncated]"
+
+            msg = _sanitize_error(raw_msg, self._api_key)
+            lower_msg = msg.lower()
+            str_exc_lower = str(exc).lower()
+
+            # 1. Structured output / JSON validation failure (400 json_validate_failed)
+            # Evaluated first to ensure large failed generations with arbitrary text aren't misclassified
             if (
-                (groq is not None and isinstance(exc, groq.AuthenticationError))
-                or "invalid api key" in lower_msg
-                or "invalid_api_key" in lower_msg
-                or "401" in lower_msg
+                error_code == "json_validate_failed"
+                or "json_validate_failed" in str_exc_lower
+            ):
+                logger.warning("Groq structured output validation failed (json_validate_failed)")
+                raise LLMStructuredOutputError(
+                    "LLM provider failed to generate valid structured JSON within output budget (code: json_validate_failed)"
+                ) from None
+
+            # 2. Authentication / invalid API key (401)
+            if (
+                status_code == 401
+                or (groq is not None and isinstance(exc, groq.AuthenticationError))
+                or (
+                    status_code != 400
+                    and any(k in lower_msg for k in ("invalid api key", "invalid_api_key"))
+                )
+                or (
+                    status_code is None
+                    and "401" in lower_msg
+                )
             ):
                 logger.error("Groq authentication failed")
                 raise LLMClientError(f"Authentication failed: {msg}") from None
 
-            # Check for rate limit (429)
+            # 3. Rate limit (429)
             if (
-                (groq is not None and isinstance(exc, groq.RateLimitError))
+                status_code == 429
+                or (groq is not None and isinstance(exc, groq.RateLimitError))
                 or "429" in lower_msg
                 or "rate limit" in lower_msg
             ):
                 logger.warning("Groq rate limit encountered (transient)")
                 raise LLMTransientError(f"Rate limit exceeded: {msg}") from None
 
-            # Check for timeout
+            # 4. Timeout
             if (
                 (groq is not None and isinstance(exc, groq.APITimeoutError))
                 or "timeout" in lower_msg
@@ -305,9 +348,10 @@ class LLMClient:
                 logger.warning("Groq timeout encountered (transient)")
                 raise LLMTransientError(f"Request timeout: {msg}") from None
 
-            # Check for provider unavailable / server errors
+            # 5. Server errors (5xx) / connection / unavailable
             if (
-                (
+                (status_code is not None and status_code >= 500)
+                or (
                     groq is not None
                     and isinstance(exc, (groq.APIConnectionError, groq.InternalServerError))
                 )

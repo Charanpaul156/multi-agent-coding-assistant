@@ -16,6 +16,7 @@ from backend.infrastructure.llm_client import (
     LLMClientError,
     LLMConfigurationError,
     LLMResponse,
+    LLMStructuredOutputError,
     LLMTransientError,
     _sanitize_error,
 )
@@ -243,6 +244,54 @@ class TestGroqErrorNormalization:
             client.generate("test prompt")
         assert "provider unavailable" in str(exc_info.value).lower()
         assert mock_groq.chat.completions.create.call_count == 3
+
+    def test_groq_json_validate_failed_normalized_to_structured_output_error(self) -> None:
+        mock_groq = MagicMock()
+        response_mock = MagicMock(status_code=400)
+        # Even if failed_generation contains "401" or "invalid api key", it must NOT be classified as auth error
+        err = groq.BadRequestError(
+            message="Failed to generate JSON",
+            response=response_mock,
+            body={
+                "error": {
+                    "message": "Failed to generate JSON",
+                    "type": "invalid_request_error",
+                    "code": "json_validate_failed",
+                    "failed_generation": "const status = 401; // invalid_api_key in code",
+                }
+            },
+        )
+        mock_groq.chat.completions.create.side_effect = err
+
+        client = LLMClient(provider="groq", client=mock_groq)
+        with pytest.raises(LLMStructuredOutputError) as exc_info:
+            client.generate("Generate website", response_format="json")
+
+        assert issubclass(LLMStructuredOutputError, LLMClientError)
+        err_msg = str(exc_info.value).lower()
+        assert "json_validate_failed" in err_msg
+        assert "authentication" not in err_msg
+        assert "failed_generation" not in str(exc_info.value)
+        # Verify it wasn't treated as transient error (not retried by tenacity)
+        assert mock_groq.chat.completions.create.call_count == 1
+
+    def test_groq_generic_400_is_client_error_not_auth_error(self) -> None:
+        mock_groq = MagicMock()
+        response_mock = MagicMock(status_code=400)
+        err = groq.BadRequestError(
+            message="Invalid parameter value",
+            response=response_mock,
+            body={"error": {"message": "Invalid parameter value"}},
+        )
+        mock_groq.chat.completions.create.side_effect = err
+
+        client = LLMClient(provider="groq", client=mock_groq)
+        with pytest.raises(LLMClientError) as exc_info:
+            client.generate("test prompt")
+
+        assert not isinstance(exc_info.value, LLMStructuredOutputError)
+        assert "authentication" not in str(exc_info.value).lower()
+        assert "invalid parameter value" in str(exc_info.value).lower()
 
 
 class TestGeminiExecutionAndNormalization:

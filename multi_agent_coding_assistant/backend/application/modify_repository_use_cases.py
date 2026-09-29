@@ -481,7 +481,16 @@ class ModifyRepositoryUseCase:
             clean_err = _sanitize_error(str(exc))
             if any(
                 term in clean_err.lower()
-                for term in ["json", "decode", "parse", "unterminated", "truncate"]
+                for term in [
+                    "json",
+                    "decode",
+                    "parse",
+                    "unterminated",
+                    "truncate",
+                    "structured",
+                    "output budget",
+                    "json_validate_failed",
+                ]
             ):
                 err_msg = (
                     "Repository coding could not parse the AI-generated change set. "
