@@ -75,11 +75,13 @@ class _FakeLLMClient:
         self.calls = 0
         self.prompts: list[str] = []
         self.system_prompts: list[str | None] = []
+        self.kwargs_list: list[dict] = []
 
-    def generate(self, prompt, *, system_prompt=None):
+    def generate(self, prompt, *, system_prompt=None, **kwargs):
         self.calls += 1
         self.prompts.append(prompt)
         self.system_prompts.append(system_prompt)
+        self.kwargs_list.append(kwargs)
         if self.exc is not None:
             raise self.exc
         if not self.responses:
@@ -205,3 +207,128 @@ def test_generate_changes_rejects_empty_prompt() -> None:
     agent = _build_agent(_FakeLLMClient())
     with pytest.raises(ValueError):
         agent.generate_changes("   ")
+
+
+def test_generate_changes_markdown_fenced_json() -> None:
+    fenced = "```json\n" + json.dumps(_create_only_json()) + "\n```"
+    client = _FakeLLMClient(responses=[fenced])
+    agent = _build_agent(client)
+
+    changes = agent.generate_changes("Create a file")
+    assert isinstance(changes, ChangeSet)
+    assert len(changes.changes) == 1
+    assert changes.changes[0].file_path == "backend/new_file.py"
+
+
+def test_generate_changes_unterminated_string_retries_and_succeeds() -> None:
+    # Unterminated string in the first response (simulating cut-off or missing quote)
+    unterminated = '{"summary": "Test", "changes": [{"file_path": "a.py", "operation": "create", "new_content": "unterminated code...'
+    client = _FakeLLMClient(responses=[unterminated, json.dumps(_create_only_json())])
+    agent = _build_agent(client)
+
+    changes = agent.generate_changes("Build something")
+    assert isinstance(changes, ChangeSet)
+    assert len(changes.changes) == 1
+    assert client.calls == 2
+    # Verify the retry prompt included the correction guidance
+    assert "CORRECTION REQUIRED" in client.prompts[1]
+    assert "correctly escaped quotes" in client.prompts[1]
+
+
+def test_generate_changes_truncated_json_fails_after_max_retries() -> None:
+    # Truncated responses on both attempts
+    truncated_1 = '{"summary": "Test", "changes": [{"file_path": "a.py", "operation": "create", "new_content": "val = 1'
+    truncated_2 = '{"summary": "Test", "changes": [{"file_path": "a.py"'
+    client = _FakeLLMClient(responses=[truncated_1, truncated_2])
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError) as exc_info:
+        agent.generate_changes("Build something")
+    assert "could not parse" in str(exc_info.value).lower()
+    assert client.calls == 2
+
+
+def test_generate_changes_sanitizes_secret_in_error_message() -> None:
+    secret = "gsk_super_confidential_key_12345"
+    client = _FakeLLMClient(exc=RuntimeError(f"Network error with key {secret}"))
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError) as exc_info:
+        agent.generate_changes("Build something")
+    err_text = str(exc_info.value)
+    assert secret not in err_text
+    assert "[REDACTED]" in err_text
+
+
+def test_generate_changes_rejects_unsafe_paths() -> None:
+    for bad_path in ["/etc/passwd", "../secret.py", "a/../../b.py"]:
+        data = _create_only_json()
+        data["changes"][0]["file_path"] = bad_path
+        client = _FakeLLMClient(responses=[json.dumps(data)])
+        agent = _build_agent(client)
+
+        with pytest.raises(CoderAgentError) as exc_info:
+            agent.generate_changes("Unsafe request")
+        assert "unsafe" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
+        assert client.calls == 1
+
+
+def test_generate_changes_large_changeset_handling() -> None:
+    # A website request with multiple files (HTML, CSS, JS, python backend, readme)
+    files = [
+        ("index.html", "create", "<!DOCTYPE html><html><body><h1>Hello</h1></body></html>"),
+        ("styles.css", "create", "body { margin: 0; font-family: sans-serif; }"),
+        ("app.js", "create", "document.addEventListener('DOMContentLoaded', () => console.log('ready'));"),
+        ("backend/server.py", "create", "from fastapi import FastAPI\napp = FastAPI()\n"),
+        ("README.md", "create", "# Website Project\nCreated via repository coder.\n"),
+    ]
+    data = {
+        "summary": "Build website files.",
+        "changes": [
+            {
+                "file_path": path,
+                "operation": op,
+                "new_content": content,
+                "description": f"add {path}",
+            }
+            for path, op, content in files
+        ],
+    }
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    changes = agent.generate_changes("Build a website")
+    assert isinstance(changes, ChangeSet)
+    assert len(changes.changes) == 5
+    assert [c.file_path for c in changes.changes] == [f[0] for f in files]
+    assert client.calls == 1
+
+
+def test_generate_changes_rejects_pathological_oversized_changeset() -> None:
+    # 51 changes exceeds the safe limit of 50
+    changes = [
+        {
+            "file_path": f"file_{i}.py",
+            "operation": "create",
+            "new_content": f"val_{i} = {i}\n",
+            "description": f"file {i}",
+        }
+        for i in range(51)
+    ]
+    data = {"summary": "Too many files", "changes": changes}
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError) as exc_info:
+        agent.generate_changes("Make 51 files")
+    assert "safe limit" in str(exc_info.value).lower()
+
+
+def test_generate_changes_requests_structured_output() -> None:
+    client = _FakeLLMClient(responses=[json.dumps(_create_only_json())])
+    agent = _build_agent(client)
+
+    agent.generate_changes("Create a file")
+    assert len(client.kwargs_list) == 1
+    assert client.kwargs_list[0].get("response_format") == "json"
+    assert client.kwargs_list[0].get("max_tokens") == 8192

@@ -45,6 +45,7 @@ from backend.infrastructure.approval_store import ApprovalStore
 from backend.infrastructure.change_applier import ChangeApplier
 from backend.infrastructure.change_validation import ChangeValidator
 from backend.infrastructure.diff_generator import diff_for_change
+from backend.infrastructure.llm_client import _sanitize_error
 from rag.config import RagConfig
 
 from agents.coder_agent import CoderAgent
@@ -477,6 +478,18 @@ class ModifyRepositoryUseCase:
             )
         except Exception as exc:
             logger.exception("ModifyRepositoryUseCase: coder failed")
+            clean_err = _sanitize_error(str(exc))
+            if any(
+                term in clean_err.lower()
+                for term in ["json", "decode", "parse", "unterminated", "truncate"]
+            ):
+                err_msg = (
+                    "Repository coding could not parse the AI-generated change set. "
+                    "The assistant will retry with a stricter structured-output request."
+                )
+            else:
+                err_msg = f"change generation failed: {clean_err}"
+
             return ModifyRepositoryResult(
                 success=False,
                 status=ModifyRepositoryStatus.VALIDATION_FAILED,
@@ -484,7 +497,7 @@ class ModifyRepositoryUseCase:
                 repository_path=request.repository_path,
                 dry_run=request.dry_run,
                 planning=planning,
-                error=f"change generation failed: {exc}",
+                error=err_msg,
             )
 
         # Populate original content/hash for modify operations.

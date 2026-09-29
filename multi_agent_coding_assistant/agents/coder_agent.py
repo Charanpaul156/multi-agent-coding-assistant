@@ -20,7 +20,7 @@ import re
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List
 
-from backend.infrastructure.llm_client import LLMClient
+from backend.infrastructure.llm_client import LLMClient, _sanitize_error
 from agents.language_support import (
     build_coder_system_prompt,
     extract_programming_language,
@@ -55,6 +55,7 @@ class CoderAgent:
         implementation_plan: Any | None = None,
         retrieved_context: str | None = None,
         plan_summary: str | None = None,
+        max_attempts: int = 2,
     ) -> ChangeSet:
         """Propose a structured ChangeSet for repository-aware modification.
 
@@ -120,32 +121,80 @@ class CoderAgent:
             prompt, retrieved_context, plan_summary
         )
 
-        logger.info("CoderAgent: generating repository changes")
-        raw_text = self._call_llm(user_prompt, system_prompt)
+        current_prompt = user_prompt
+        last_error = ""
 
-        try:
-            data = self._parse_json(raw_text)
-            return self._validate_and_build_changeset(data)
-        except CoderAgentError as exc:
-            if "malformed" not in str(exc).lower():
-                raise
-            logger.warning(
-                "CoderAgent: failed first parse (%s); retrying once", exc
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                "CoderAgent: generating repository changes (attempt %d/%d)",
+                attempt,
+                max_attempts,
             )
-            retry = (
-                "The previous response was not valid JSON matching the "
-                "required schema. Return ONLY corrected valid JSON. "
-                "Do not add explanations."
+            raw_text = self._call_llm(
+                current_prompt,
+                system_prompt,
+                response_format="json",
+                max_tokens=8192,
             )
-            raw_retry = self._call_llm(retry, system_prompt)
+
             try:
-                data_retry = self._parse_json(raw_retry)
-                return self._validate_and_build_changeset(data_retry)
-            except Exception as exc2:
-                logger.exception("CoderAgent: retry failed")
-                raise CoderAgentError(
-                    "Invalid change-generation response from LLM"
-                ) from exc2
+                data = self._parse_json(raw_text)
+                return self._validate_and_build_changeset(data)
+            except CoderAgentError as exc:
+                last_error = str(exc)
+                is_recoverable_parse_error = any(
+                    k in last_error.lower()
+                    for k in ("malformed", "truncated", "unterminated", "json")
+                )
+                if not is_recoverable_parse_error:
+                    logger.warning(
+                        "CoderAgent: schema validation error (non-retryable): %s",
+                        last_error,
+                    )
+                    raise
+
+                logger.warning(
+                    "Repository coding could not parse the AI-generated change set (attempt %d/%d): %s. "
+                    "The assistant will retry with a stricter structured-output request.",
+                    attempt,
+                    max_attempts,
+                    last_error,
+                )
+
+                if attempt >= max_attempts:
+                    logger.exception(
+                        "CoderAgent: retry failed after %d attempts", max_attempts
+                    )
+                    raise CoderAgentError(
+                        f"Repository coding could not parse the AI-generated change set: {last_error}"
+                    ) from exc
+
+                is_truncated = (
+                    "truncated" in last_error.lower()
+                    or "unterminated" in last_error.lower()
+                )
+                truncation_note = (
+                    "\nYour previous response appeared truncated or had unterminated strings. "
+                    "Keep file contents complete, properly closed, and within token limits."
+                    if is_truncated
+                    else ""
+                )
+
+                current_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"[CORRECTION REQUIRED - INVALID JSON OUTPUT]\n"
+                    f"Your previous response was not valid JSON ({last_error}).{truncation_note}\n\n"
+                    f"Return ONLY a valid JSON object matching the required ChangeSet schema.\n\n"
+                    f"Every file content must be a valid JSON string with correctly escaped quotes, "
+                    f"backslashes, and newlines.\n\n"
+                    f"Do not use Markdown fences.\n"
+                    f"Do not add explanations.\n"
+                    f"Do not truncate file contents."
+                )
+
+        raise CoderAgentError(
+            f"Failed to generate valid repository changes after {max_attempts} attempts: {last_error}"
+        )
 
     def generate_code(
         self,
@@ -263,45 +312,112 @@ class CoderAgent:
         )
         return "\n\n---\n\n".join(parts)
 
-    def _call_llm(self, prompt: str, system_prompt: str) -> str:
+    def _call_llm(
+        self,
+        prompt: str,
+        system_prompt: str,
+        *,
+        response_format: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
         try:
-            response = self.llm_client.generate(
-                prompt, system_prompt=system_prompt
-            )
+            kwargs: Dict[str, Any] = {"system_prompt": system_prompt}
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            response = self.llm_client.generate(prompt, **kwargs)
+            return (response.text or "").strip()
+        except TypeError:
+            # Fallback if injected fake client only accepts (prompt, system_prompt=...)
+            response = self.llm_client.generate(prompt, system_prompt=system_prompt)
             return (response.text or "").strip()
         except CoderAgentError:
             raise
         except Exception as exc:
+            sanitized = _sanitize_error(str(exc))
             raise CoderAgentError(
-                f"LLM failure during change generation: {exc}"
+                f"LLM failure during change generation: {sanitized}"
             ) from exc
 
+    def _is_truncated_json(self, text: str, err: Exception) -> bool:
+        """Detect if a JSON string appears to be truncated mid-generation."""
+        err_msg = str(err).lower()
+        if "unterminated string" in err_msg:
+            return True
+        if "expecting value" in err_msg or "expecting property name" in err_msg:
+            stripped = text.strip()
+            if (
+                stripped.endswith(":")
+                or stripped.endswith(",")
+                or stripped.endswith('"')
+                or stripped.endswith("\\")
+            ):
+                return True
+        if text.count("{") > text.count("}"):
+            return True
+        if text.count("[") > text.count("]"):
+            return True
+        return False
+
     def _parse_json(self, text: str) -> Dict[str, Any]:
+        """Safely parse JSON from LLM response, detecting malformed or truncated payloads."""
+        if not isinstance(text, str) or not text.strip():
+            raise CoderAgentError("Empty response from LLM; expected a JSON ChangeSet.")
+
         cleaned = _strip_markdown_code_fences(text).strip()
 
+        # 1. Attempt standard JSON parsing first on cleaned text
         try:
             parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
                 return parsed
-        except json.JSONDecodeError:
-            pass
+            raise CoderAgentError(
+                f"Malformed JSON: expected a JSON object (dict), got {type(parsed).__name__}"
+            )
+        except json.JSONDecodeError as err:
+            first_err = err
 
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if match:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
+        # 2. Locate the intended outer JSON object safely without greedy arbitrary regex
+        start_idx = cleaned.find("{")
+        end_idx = cleaned.rfind("}")
 
-        raise CoderAgentError("Malformed JSON from LLM")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            candidate = cleaned[start_idx : end_idx + 1]
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+                raise CoderAgentError(
+                    f"Malformed JSON: expected a JSON object (dict), got {type(parsed).__name__}"
+                )
+            except json.JSONDecodeError as err:
+                parse_err = err
+        else:
+            parse_err = first_err
+
+        # 3. Detect malformed vs truncated JSON
+        if self._is_truncated_json(cleaned, parse_err):
+            raise CoderAgentError(
+                "Truncated JSON response from LLM: unterminated string or incomplete brackets."
+            )
+
+        sanitized_msg = _sanitize_error(str(parse_err))
+        raise CoderAgentError(f"Malformed JSON from LLM: {sanitized_msg}")
 
     def _validate_and_build_changeset(self, data: Dict[str, Any]) -> ChangeSet:
         """Strictly validate LLM change JSON and build a ChangeSet."""
+        if not isinstance(data, dict):
+            raise CoderAgentError("ChangeSet payload must be a JSON object (dict)")
         if "changes" not in data or not isinstance(data["changes"], list):
             raise CoderAgentError(
                 "changes field missing or not a list in change JSON"
             )
         if not data["changes"]:
             raise CoderAgentError("changes list must not be empty")
+
+        if len(data["changes"]) > 50:
+            raise CoderAgentError("ChangeSet exceeds safe limit of 50 files per generation")
 
         summary = data.get("summary", "")
         if not isinstance(summary, str):
@@ -340,9 +456,24 @@ class CoderAgent:
             raise CoderAgentError(
                 f"change at index {idx} has invalid file_path"
             )
+        if (
+            file_path.startswith("/")
+            or file_path.startswith("\\")
+            or file_path.startswith("../")
+            or "/../" in file_path
+            or file_path.endswith("/..")
+            or file_path == ".."
+        ):
+            raise CoderAgentError(
+                f"change at index {idx} has invalid or unsafe file_path: {file_path}"
+            )
         if not isinstance(new_content, str) or not new_content.strip():
             raise CoderAgentError(
                 f"change at index {idx} has invalid new_content"
+            )
+        if len(new_content.encode("utf-8")) > 2_000_000:
+            raise CoderAgentError(
+                f"change at index {idx} exceeds maximum content size limit"
             )
         if operation_raw not in ("create", "modify"):
             raise CoderAgentError(

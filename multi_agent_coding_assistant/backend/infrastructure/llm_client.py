@@ -191,6 +191,8 @@ class LLMClient:
         prompt: str,
         system_prompt: Optional[str],
         temperature: Optional[float],
+        max_tokens: Optional[int] = None,
+        response_format: Optional[str] = None,
     ) -> str:
         system_prefix = "" if not system_prompt else f"{system_prompt}\n\n"
         full_prompt = f"{system_prefix}{prompt}"
@@ -201,11 +203,20 @@ class LLMClient:
                 "model": self._model,
                 "contents": full_prompt,
             }
+            config_dict: dict[str, Any] = {}
             temp = temperature if temperature is not None else self._temperature
             if temp is not None:
+                config_dict["temperature"] = temp
+            if max_tokens is not None:
+                config_dict["max_output_tokens"] = max_tokens
+            if response_format in ("json", "json_object"):
+                config_dict["response_mime_type"] = "application/json"
+
+            if config_dict:
                 from google.genai import types
 
-                kwargs["config"] = types.GenerateContentConfig(temperature=temp)
+                kwargs["config"] = types.GenerateContentConfig(**config_dict)
+
             resp = self._client.models.generate_content(**kwargs)
         except Exception as exc:
             msg = _sanitize_error(str(exc), self._api_key)
@@ -237,6 +248,8 @@ class LLMClient:
         prompt: str,
         system_prompt: Optional[str],
         temperature: Optional[float],
+        max_tokens: Optional[int] = None,
+        response_format: Optional[str] = None,
     ) -> str:
         messages: list[dict[str, str]] = []
         if system_prompt:
@@ -252,6 +265,13 @@ class LLMClient:
             temp = temperature if temperature is not None else self._temperature
             if temp is not None:
                 kwargs["temperature"] = temp
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if response_format in ("json", "json_object"):
+                kwargs["response_format"] = {"type": "json_object"}
+            elif isinstance(response_format, dict):
+                kwargs["response_format"] = response_format
+
             completion = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             msg = _sanitize_error(str(exc), self._api_key)
@@ -333,6 +353,8 @@ class LLMClient:
         *,
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[str] = None,
     ) -> LLMResponse:
         """Generate text from a prompt using the configured LLM provider.
 
@@ -342,9 +364,21 @@ class LLMClient:
             raise ValueError("prompt must be a non-empty string")
 
         if self._provider == "gemini":
-            text = self._generate_gemini(prompt, system_prompt, temperature)
+            text = self._generate_gemini(
+                prompt,
+                system_prompt,
+                temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
         elif self._provider == "groq":
-            text = self._generate_groq(prompt, system_prompt, temperature)
+            text = self._generate_groq(
+                prompt,
+                system_prompt,
+                temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
         else:
             raise LLMConfigurationError(f"Unknown provider: {self._provider}")
 

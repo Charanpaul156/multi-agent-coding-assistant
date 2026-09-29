@@ -21,6 +21,7 @@ from agents.planner_agent import ImplementationPlan
 from agents.code_reviewer_agent import ReviewReport
 from agents.debugger_agent import DebugReport, DebuggerAgent
 from agents.documentation_agent import DocumentationReport
+from backend.infrastructure.llm_client import _sanitize_error
 from backend.application.use_cases import (
     GenerateCodeRequest,
     GenerateCodeResult,
@@ -688,13 +689,24 @@ class RunWorkflowUseCase:
             )
         except Exception as exc:
             logger.exception("Repository Coder FAILED")
+            clean_error = _sanitize_error(str(exc))
+            if any(
+                term in clean_error.lower()
+                for term in ["json", "decode", "parse", "unterminated", "truncate"]
+            ):
+                user_msg = (
+                    "Repository coding could not parse the AI-generated change set. "
+                    "The assistant will retry with a stricter structured-output request."
+                )
+            else:
+                user_msg = clean_error
             return self._fail(
                 "repository coding",
                 WorkflowStatus.CODING_FAILED,
                 request.prompt,
                 start,
                 planning=planning,
-                error=str(exc),
+                error=user_msg,
                 emitter=emitter,
                 job_id=job_id,
             )
