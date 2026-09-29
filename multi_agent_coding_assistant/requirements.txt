@@ -10,5 +10,6 @@ requests
 pytest
 chromadb
 sentence-transformers
+groq
 # uvicorn backend.main:app --reload
 # streamlit run frontend/app.py

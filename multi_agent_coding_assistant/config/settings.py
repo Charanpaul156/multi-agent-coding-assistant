@@ -5,6 +5,8 @@ Uses python-dotenv and pydantic-settings for validation.
 
 from functools import lru_cache
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,10 +14,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 @lru_cache(maxsize=1)
 def _load_env() -> None:
     load_dotenv()
+    backend_env = Path("backend/.env")
+    if backend_env.exists():
+        load_dotenv(dotenv_path=str(backend_env), override=False)
 
 
 class Settings(BaseSettings):
     """Strongly-typed configuration."""
+
+    # --- LLM Provider configuration ---------------------------------------
+    llm_provider: str = "gemini"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
+    groq_api_key: str | None = None
+    groq_model: str = "openai/gpt-oss-120b"
 
     openai_api_key: str | None = None
 
