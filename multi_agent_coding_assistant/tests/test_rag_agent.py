@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from agents.rag_agent import (
     RagAgent,
@@ -12,6 +13,7 @@ from agents.rag_agent import (
 )
 from backend.infrastructure.llm_client import LLMResponse
 from rag.retriever import RetrievedChunk
+from rag.retriever import RepositoryRetriever
 
 
 class _FakeRetriever:
@@ -86,3 +88,96 @@ def test_rag_agent_empty_query_raises() -> None:
         agent.research("")
     with pytest.raises(TypeError):
         agent.research(None)  # type: ignore[arg-type]
+
+
+def test_empty_retrieval_returns_insufficient_evidence_without_llm_call() -> None:
+    llm = _FakeLLMClient('{"summary": "invented", "answer": "invented"}')
+    agent = RagAgent(llm_client=llm, retriever=_FakeRetriever([]))  # type: ignore[arg-type]
+
+    report = agent.research("Where is auth implemented?")
+
+    assert report.evidence_status == "insufficient"
+    assert report.sources == []
+    assert "unknown" in report.answer
+    assert llm.last_prompt is None
+
+
+def test_invalid_retrieved_documents_are_omitted() -> None:
+    retriever = _FakeRetriever([SimpleNamespace(file_path="", content="no provenance")])
+    agent = RagAgent(retriever=retriever)  # type: ignore[arg-type]
+
+    report = agent.research("Find the implementation")
+
+    assert report.evidence_status == "insufficient"
+    assert report.sources == []
+
+
+def test_retrieval_failure_returns_unavailable_report() -> None:
+    class BrokenRetriever:
+        def retrieve(self, query: str, top_k: int = 5):
+            raise RuntimeError("vector store unavailable")
+
+    agent = RagAgent(retriever=BrokenRetriever())
+
+    report = agent.research("Find auth")
+
+    assert report.evidence_status == "unavailable"
+    assert report.warnings
+    assert report.sources == []
+
+
+@pytest.mark.parametrize("failure_stage", ["embedding", "vector_store"])
+def test_embedding_and_vector_store_failures_return_unavailable_report(
+    failure_stage: str,
+) -> None:
+    class TestEmbedder:
+        def embed_query(self, query: str) -> list[float]:
+            if failure_stage == "embedding":
+                raise RuntimeError("embedding service unavailable")
+            return [1.0]
+
+    class TestVectorStore:
+        def similarity_search(self, query_embedding, top_k=5, metadata_filter=None):
+            raise RuntimeError("vector database unavailable")
+
+    retriever = RepositoryRetriever(TestVectorStore(), TestEmbedder())  # type: ignore[arg-type]
+    report = RagAgent(retriever=retriever).research("Find auth")
+
+    assert report.evidence_status == "unavailable"
+    assert report.sources == []
+    assert report.warnings
+
+
+def test_llm_failure_preserves_retrieved_source_evidence() -> None:
+    class BrokenLLM:
+        def generate(self, prompt: str, *, system_prompt: str | None = None):
+            raise RuntimeError("provider unavailable")
+
+    chunk = RetrievedChunk(
+        content="def login(): pass",
+        file_path="src/auth.py",
+        start_line=4,
+        end_line=4,
+        language="python",
+        repository="repo",
+        chunk_index=0,
+        distance=0.1,
+    )
+    agent = RagAgent(llm_client=BrokenLLM(), retriever=_FakeRetriever([chunk]))  # type: ignore[arg-type]
+
+    report = agent.research("Where is login?")
+
+    assert report.evidence_status == "available"
+    assert report.sources[0].file_path == "src/auth.py"
+    assert report.warnings
+    assert report.confidence == 0.0
+
+
+def test_report_models_keep_legacy_positional_construction() -> None:
+    source = SourceReference("src/app.py", 1, 2, 0.8, "def app(): pass")
+    report = ResearchReport("query", "summary", "answer", [source])
+
+    assert source.language == ""
+    assert report.sources == [source]
+    assert report.evidence_status == "available"
+

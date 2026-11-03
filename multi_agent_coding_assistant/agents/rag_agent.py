@@ -1,266 +1,303 @@
-"""Researcher / RAG Agent.
+"""Research / RAG agent.
 
-This agent is responsible for repository-wide contextual understanding, semantic
-codebase retrieval, source dependency extraction, and synthesizing grounded,
-citation-backed answers about a codebase.
-
-RESPONSIBILITIES:
-- Semantic codebase retrieval and relevance ranking.
-- Filtering low-relevance retrieval results to minimize noise.
-- Extracting related code dependencies (imports, module relationships, callers).
-- Providing exact source file and location references (path, start/end lines).
-- Synthesizing structured research reports for codebase Q&A and architecture inquiries.
-
-STRICT CONSTRAINTS:
-- NEVER write or modify files on disk.
-- NEVER execute code or shell commands.
-- It communicates ONLY through dependency-injected `LLMClient` and `RepositoryRetriever`.
+This agent retrieves relevant repository context, extracts structured evidence,
+then asks the LLM to produce a concise engineering answer grounded in the
+retrieved snippets. The implementation intentionally stays dependency-light so
+it can be used by the orchestrator and tests without a full vector-store setup.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterable, List, Optional
 
-from backend.infrastructure.llm_client import LLMClient, _sanitize_error
-from rag.retriever import RepositoryRetriever, RetrievedChunk
+from backend.infrastructure.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
 
 class RagAgentError(RuntimeError):
-    """Base error for RAG / Researcher agent failures."""
+    """Base error for RAG agent failures."""
 
 
 @dataclass(frozen=True)
 class SourceReference:
-    """Exact source location reference cited in research."""
+    """Single source snippet used to ground an answer."""
 
     file_path: str
     start_line: int
     end_line: int
-    language: str
-    snippet: str
-    relevance_score: float = 1.0
+    relevance_score: float
+    snippet: str = ""
+    language: str = ""
+    chunk_index: int = 0
+    ranking_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class ResearchReport:
-    """Structured report produced by the Researcher / RAG Agent."""
+    """Structured repository research report."""
 
     query: str
-    answer: str
     summary: str
+    answer: str
     sources: List[SourceReference] = field(default_factory=list)
     related_dependencies: List[str] = field(default_factory=list)
     architecture_insights: List[str] = field(default_factory=list)
-    confidence: float = 1.0
+    confidence: float = 0.0
+    evidence_status: str = "available"
+    warnings: List[str] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
 
 
 class RagAgent:
-    """Intelligent codebase researcher and repository query answering agent."""
+    """Retrieve code context and synthesize a repository-aware answer."""
 
     def __init__(
         self,
-        llm_client: LLMClient,
-        retriever: Optional[RepositoryRetriever] = None,
+        *,
+        llm_client: Optional[LLMClient] = None,
+        retriever: Optional[Any] = None,
+        top_k: int = 5,
     ) -> None:
         self._llm_client = llm_client
         self._retriever = retriever
+        self._top_k = max(1, min(50, int(top_k)))
 
-    @property
-    def retriever(self) -> Optional[RepositoryRetriever]:
-        return self._retriever
+    def run(self, query: str) -> ResearchReport:
+        """Backward-compatible alias to ``research()``."""
+        return self.research(query)
 
-    def run(self, query: str, **kwargs: Any) -> ResearchReport:
-        """Execute codebase research query (backward-compatible entrypoint)."""
-        return self.research(query, **kwargs)
-
-    def research(
-        self,
-        query: str,
-        *,
-        repository: Optional[str] = None,
-        top_k: int = 5,
-        min_relevance: float = 0.0,
-        retrieved_context: Optional[str] = None,
-    ) -> ResearchReport:
-        """Search codebase and synthesize a structured, grounded answer.
-
-        Args:
-            query: Natural language query about the codebase or architecture.
-            repository: Optional repository identifier filter.
-            top_k: Number of semantic chunks to retrieve.
-            min_relevance: Minimum relevance score (0.0 to 1.0) to include a chunk.
-            retrieved_context: Optional pre-retrieved context string if retriever is omitted.
-
-        Returns:
-            A structured ResearchReport with citations, dependencies, and insights.
-        """
+    def research(self, query: str) -> ResearchReport:
+        """Retrieve relevant repository content and answer the user query."""
         if not isinstance(query, str):
             raise TypeError("query must be a string")
         if not query.strip():
             raise ValueError("query must be non-empty")
 
-        chunks: List[RetrievedChunk] = []
-        if self._retriever is not None:
-            try:
-                raw_chunks = self._retriever.retrieve(
-                    query, top_k=top_k, repository=repository
-                )
-                chunks = self._filter_and_rank_chunks(raw_chunks, min_relevance=min_relevance)
-            except Exception as exc:
-                logger.warning("RAG retriever failed: %s; falling back to context", exc)
-
-        sources = self._build_source_references(chunks)
-        dependencies = self._extract_dependencies(chunks)
-
-        # Build prompt for LLM synthesis
-        context_text = self._format_chunks_for_llm(chunks)
-        if retrieved_context and not context_text:
-            context_text = retrieved_context
-
-        system_prompt = (
-            "You are a Senior Principal Software Architect and Repository Researcher.\n"
-            "Your task is to analyze codebase context and answer technical queries with precision.\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "1. Answer based ONLY on the provided codebase context and factual architecture.\n"
-            "2. Always cite specific files, functions, classes, and line numbers where appropriate.\n"
-            "3. Identify related module dependencies, callers, and architectural patterns.\n"
-            "4. Return ONLY valid JSON matching the exact schema below.\n"
-            "5. Do NOT include markdown code fences (```json) outside the JSON.\n\n"
-            "SCHEMA:\n"
-            "{\n"
-            '  "summary": "1-2 sentence concise executive answer",\n'
-            '  "answer": "Comprehensive, technical, markdown-formatted answer with file references",\n'
-            '  "architecture_insights": ["Key architectural insight 1", "Insight 2"],\n'
-            '  "confidence": 0.95\n'
-            "}"
-        )
-
-        user_prompt = f"Technical Query: {query}\n\n"
-        if context_text:
-            user_prompt += f"--- Codebase Context ---\n{context_text}\n\n"
-        if dependencies:
-            user_prompt += f"--- Detected Dependencies ---\n{', '.join(dependencies[:20])}\n\n"
-        user_prompt += "Synthesize a structured research report answering the technical query."
+        if self._retriever is None:
+            return self._unavailable_report(query, warning="No retriever is configured.")
 
         try:
-            response = self._llm_client.generate(user_prompt, system_prompt=system_prompt)
-            data = self._parse_json(response.text or "")
+            chunks = list(self._retriever.retrieve(query, top_k=self._top_k) or [])
         except Exception as exc:
-            sanitized = _sanitize_error(str(exc))
-            logger.warning("RagAgent LLM synthesis failed: %s; using deterministic fallback", sanitized)
-            data = {
-                "summary": f"Research results for '{query}' with {len(sources)} referenced sources.",
-                "answer": f"Found {len(sources)} relevant sections in the repository matching the query.\n\n"
-                + "\n".join(f"- `{s.file_path}` (lines {s.start_line}-{s.end_line})" for s in sources),
-                "architecture_insights": [f"Referenced {len(sources)} files across the repository."],
-                "confidence": 0.7 if sources else 0.3,
+            logger.warning("Repository retrieval failed: %s", exc)
+            return self._unavailable_report(query, warning="Repository retrieval failed.")
+
+        chunks = [
+            chunk
+            for chunk in chunks
+            if isinstance(getattr(chunk, "file_path", None), str)
+            and bool(getattr(chunk, "file_path", "").strip())
+            and isinstance(getattr(chunk, "content", None), str)
+            and bool(getattr(chunk, "content", "").strip())
+        ]
+        sources = self._build_sources(chunks)
+        if not sources:
+            return ResearchReport(
+                query=query,
+                summary="No relevant repository evidence was retrieved.",
+                answer="I could not find repository evidence to answer this query. The answer is unknown from the indexed context.",
+                sources=[],
+                related_dependencies=[],
+                architecture_insights=[],
+                confidence=0.0,
+                evidence_status="insufficient",
+                warnings=["No valid source chunks were returned by retrieval."],
+            )
+
+        related_dependencies = self._extract_dependencies(chunks)
+
+        llm_payload = self._build_llm_prompt(query, chunks)
+        warnings: List[str] = []
+        try:
+            response_text = self._generate_response(llm_payload)
+            parsed = self._parse_response(response_text)
+        except Exception as exc:
+            logger.warning("Research answer generation failed: %s", exc)
+            parsed = {
+                "summary": "Relevant repository evidence was retrieved, but answer synthesis failed.",
+                "answer": "The retrieved source snippets are available, but a synthesized answer could not be generated.",
+                "architecture_insights": [],
+                "confidence": 0.0,
+                "assumptions": [],
+                "recommendations": [],
             }
+            warnings.append("Answer synthesis failed; report contains retrieved evidence only.")
 
         return ResearchReport(
             query=query,
-            summary=str(data.get("summary", "")),
-            answer=str(data.get("answer", "")),
+            summary=self._string_or_default(parsed.get("summary"), "No relevant summary available."),
+            answer=self._compose_answer(query, self._string_or_default(parsed.get("answer"), ""), sources),
             sources=sources,
-            related_dependencies=dependencies,
-            architecture_insights=list(data.get("architecture_insights", [])),
-            confidence=float(data.get("confidence", 0.9)),
+            related_dependencies=related_dependencies,
+            architecture_insights=self._string_list(parsed.get("architecture_insights")),
+            confidence=self._confidence(parsed.get("confidence")),
+            evidence_status="available",
+            warnings=warnings,
+            assumptions=self._string_list(parsed.get("assumptions")),
+            recommendations=self._string_list(parsed.get("recommendations")),
         )
 
-    def _filter_and_rank_chunks(
-        self, chunks: List[RetrievedChunk], min_relevance: float
-    ) -> List[RetrievedChunk]:
-        """Filter out low-relevance chunks and rank by normalized similarity."""
-        scored_chunks: List[tuple[float, RetrievedChunk]] = []
+    @staticmethod
+    def _unavailable_report(query: str, warning: str) -> ResearchReport:
+        return ResearchReport(
+            query=query,
+            summary="Repository context is currently unavailable.",
+            answer="I could not retrieve repository evidence for this query. The answer is unknown from the indexed context.",
+            evidence_status="unavailable",
+            warnings=[warning],
+        )
+
+    @staticmethod
+    def _string_or_default(value: Any, default: str) -> str:
+        return value.strip() if isinstance(value, str) and value.strip() else default
+
+    @staticmethod
+    def _string_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+    @staticmethod
+    def _confidence(value: Any) -> float:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return max(0.0, min(1.0, confidence)) if math.isfinite(confidence) else 0.0
+
+    def _generate_response(self, prompt: str) -> str:
+        if self._llm_client is None:
+            return json.dumps(
+                {
+                    "summary": "Repository context suggests a likely implementation path.",
+                    "answer": "No LLM client is configured, so the answer is based on retrieved context only.",
+                    "architecture_insights": [],
+                    "confidence": 0.5,
+                    "assumptions": [],
+                    "recommendations": [],
+                }
+            )
+        response = self._llm_client.generate(
+            prompt,
+            system_prompt=(
+                "You are a repository research assistant. Treat retrieved snippets as the only repository evidence. "
+                "Do not invent files, symbols, dependencies, callers, or architecture. Clearly label assumptions and state when evidence is insufficient."
+            ),
+        )
+        if isinstance(response, str):
+            return response.strip()
+        return str(getattr(response, "text", "") or "").strip()
+
+    def _parse_response(self, response_text: str) -> dict[str, Any]:
+        cleaned = response_text.strip()
+        if not cleaned:
+            return {
+                "summary": "No relevant summary available.",
+                "answer": "No applicable answer generated.",
+                "architecture_insights": [],
+                "confidence": 0.0,
+                "assumptions": [],
+                "recommendations": [],
+            }
+        try:
+            payload = json.loads(cleaned)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+
+        summary = cleaned[:200].strip()
+        return {
+            "summary": summary or "No relevant summary available.",
+            "answer": cleaned,
+            "architecture_insights": [],
+            "confidence": 0.5,
+        }
+
+    def _build_sources(self, chunks: Iterable[Any]) -> List[SourceReference]:
+        sources: List[SourceReference] = []
         for chunk in chunks:
-            # If distance is provided, convert to similarity score in [0.0, 1.0]
-            if chunk.distance is not None:
-                sim = 1.0 / (1.0 + max(0.0, float(chunk.distance)))
-            else:
-                sim = 1.0
-
-            if sim >= min_relevance:
-                scored_chunks.append((sim, chunk))
-
-        scored_chunks.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored_chunks]
-
-    def _build_source_references(
-        self, chunks: List[RetrievedChunk]
-    ) -> List[SourceReference]:
-        refs: List[SourceReference] = []
-        for c in chunks:
-            sim = 1.0
-            if c.distance is not None:
-                sim = round(1.0 / (1.0 + max(0.0, float(c.distance))), 3)
-            # Truncate snippet preview for reference
-            snippet = "\n".join(c.content.splitlines()[:6])
-            refs.append(
+            file_path = getattr(chunk, "file_path", "")
+            content = getattr(chunk, "content", "")
+            if not isinstance(file_path, str) or not file_path.strip() or not isinstance(content, str) or not content.strip():
+                logger.warning("Skipping retrieved chunk without a valid path or content")
+                continue
+            start_line = self._safe_int(getattr(chunk, "start_line", 0))
+            end_line = self._safe_int(getattr(chunk, "end_line", 0))
+            relevance = self._confidence(getattr(chunk, "ranking_score", None))
+            if relevance == 0.0:
+                distance = self._confidence(1.0 - self._confidence(getattr(chunk, "distance", 0.0)))
+                relevance = distance
+            reasons = getattr(chunk, "ranking_reasons", ())
+            sources.append(
                 SourceReference(
-                    file_path=c.file_path,
-                    start_line=c.start_line,
-                    end_line=c.end_line,
-                    language=c.language,
-                    snippet=snippet,
-                    relevance_score=sim,
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    relevance_score=relevance,
+                    snippet=content[:500],
+                    language=str(getattr(chunk, "language", "") or ""),
+                    chunk_index=self._safe_int(getattr(chunk, "chunk_index", 0)),
+                    ranking_reasons=[reason for reason in reasons if isinstance(reason, str)] if isinstance(reasons, (list, tuple)) else [],
                 )
             )
-        return refs
+        return sources
 
-    def _extract_dependencies(self, chunks: List[RetrievedChunk]) -> List[str]:
-        """Extract imported modules, symbols, and cross-file references."""
-        deps: set[str] = set()
-        for chunk in chunks:
-            if chunk.language == "python":
-                try:
-                    tree = ast.parse(chunk.content)
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.Import):
-                            for alias in node.names:
-                                deps.add(alias.name)
-                        elif isinstance(node, ast.ImportFrom):
-                            if node.module:
-                                deps.add(node.module)
-                except Exception:
-                    # Fallback regex for partial chunks
-                    for line in chunk.content.splitlines():
-                        match = re.match(r"^\s*(?:from|import)\s+([a-zA-Z0-9_\.]+)", line)
-                        if match:
-                            deps.add(match.group(1))
-            elif chunk.language in ("javascript", "typescript"):
-                for line in chunk.content.splitlines():
-                    match = re.search(r'(?:from|require\()\s*[\'"]([^\'"]+)[\'"]', line)
-                    if match:
-                        deps.add(match.group(1))
-        return sorted(deps)
-
-    def _format_chunks_for_llm(self, chunks: List[RetrievedChunk]) -> str:
-        parts: List[str] = []
-        for idx, c in enumerate(chunks, 1):
-            parts.append(
-                f"[Source {idx}] File: {c.file_path} (Lines {c.start_line}-{c.end_line}, Lang: {c.language}):\n"
-                f"```\n{c.content}\n```"
-            )
-        return "\n\n".join(parts)
-
-    def _parse_json(self, raw_text: str) -> Dict[str, Any]:
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-            cleaned = cleaned.strip()
-
+    @staticmethod
+    def _safe_int(value: Any) -> int:
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            raise RagAgentError("Failed to parse valid JSON response from LLM")
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _extract_dependencies(self, chunks: Iterable[Any]) -> List[str]:
+        deps: List[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            content = getattr(chunk, "content", "") or ""
+            if not isinstance(content, str):
+                continue
+            for match in re.findall(r"(?:from\s+([A-Za-z0-9_\.]+)\s+import)|(?:import\s+([A-Za-z0-9_\.]+))", content):
+                module = next((m for m in match if m), "")
+                if module and module not in seen:
+                    deps.append(module)
+                    seen.add(module)
+        return deps
+
+    def _build_llm_prompt(self, query: str, chunks: Iterable[Any]) -> str:
+        rendered_chunks = []
+        for index, chunk in enumerate(chunks, start=1):
+            score = self._confidence(getattr(chunk, "ranking_score", 0.0))
+            reasons = getattr(chunk, "ranking_reasons", ())
+            reason_text = ", ".join(reasons) if isinstance(reasons, (list, tuple)) else ""
+            rendered_chunks.append(
+                f"Source S{index}: {getattr(chunk, 'file_path', '')}"
+                f" (lines {self._safe_int(getattr(chunk, 'start_line', 0))}-"
+                f"{self._safe_int(getattr(chunk, 'end_line', 0))})\n"
+                f"Ranking: {score:.2f}; reasons: {reason_text}\n"
+                f"Content:\n{getattr(chunk, 'content', '')}"
+            )
+        chunk_text = "\n\n".join(rendered_chunks)
+        return (
+            "Answer using only repository facts supported by the evidence below. Cite source labels (for example S1) for repository claims. "
+            "Do not invent files, symbols, dependencies, relationships, or line numbers. Distinguish recommendations from observed facts and say when evidence is insufficient.\n"
+            f"Question: {query}\n\n"
+            "Return valid JSON with keys: summary, answer, architecture_insights, confidence, assumptions, recommendations.\n"
+            "If evidence is incomplete, state the limitation clearly.\n\n"
+            f"Repository context:\n{chunk_text}"
+        )
+
+    def _compose_answer(self, query: str, answer: str, sources: List[SourceReference]) -> str:
+        base = answer.strip() if answer.strip() else "I did not find a direct answer in the repository context."
+        if not sources:
+            return f"{base}"
+        files = ", ".join(sorted({source.file_path for source in sources if source.file_path}))
+        return f"{base} Relevant files include: {files}."
+

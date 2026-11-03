@@ -1,15 +1,15 @@
 # Multi-Agent Coding Assistant
 
-Production-quality portfolio project foundation.
+Modular multi-agent software engineering assistant with repository-aware RAG, orchestration, and validation workflows.
 
 ## Project overview
-This repository scaffolds a **modular multi-agent AI software engineering team**.
+This repository implements a **modular multi-agent AI software engineering team**.
 - Backend: **FastAPI** (API surface + dependency scaffolding)
 - Frontend: **Streamlit** (UI scaffold)
-- Agents: placeholders for future **CrewAI** agents (Planner/Coder/Reviewer/Test/Debug/Docs/RAG)
-- RAG/Vector DB: prepared for future **LangChain + ChromaDB** integration
+- Agents: specialized Planner/Coder/Reviewer/Test/Debug/Docs/Researcher components
+- Repository RAG: dependency-injected retrieval, embeddings, vector-store abstraction, and evidence-backed research reports
 
-At this stage, **no agent workflows or AI business logic are implemented**.
+RAG retrieval and orchestration are implemented; provider integrations and capabilities depend on the configured services.
 
 ## Folder structure
 Clean architecture mapping is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -17,9 +17,9 @@ Clean architecture mapping is documented in [`docs/ARCHITECTURE.md`](docs/ARCHIT
 High-level folders:
 - `backend/`: FastAPI app (API, application, domain, infrastructure)
 - `frontend/`: Streamlit UI
-- `agents/`: CrewAI agent placeholders (not implemented)
+- `agents/`: specialized agents and orchestration-facing interfaces
 - `tools/`: tool abstractions/registry placeholder
-- `rag/`: RAG placeholder modules (not implemented)
+- `rag/`: repository loading, chunking, embedding, vector search, and retrieval ranking
 - `config/`: typed configuration loading
 - `tests/`: test scaffolding
 - `docs/`: additional documentation
@@ -55,7 +55,6 @@ streamlit run frontend/app.py
 - CrewAI team wiring (Planner/Coder/Reviewer/Test/Debug/Docs/RAG agents)
 - LLM provider integration in `backend/infrastructure/llm_client.py`
 - Vector store (ChromaDB) integration in `backend/infrastructure/vector_store.py`
-- RAG pipeline using `rag/` modules (LangChain + ChromaDB)
 - Use-case orchestration layer in `backend/application/`
 - Additional API endpoints and end-to-end tests
 
