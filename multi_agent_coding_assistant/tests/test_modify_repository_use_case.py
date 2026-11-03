@@ -252,15 +252,47 @@ def test_empty_request_rejected(config):
 def test_path_outside_allowed_root_rejected(config):
     uc = _build_use_case(config=config)
     # Use a path that is not under the allowed root.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         uc.execute(ModifyRepositoryRequest(repository_path="C:/somewhere/else", request="x"))
+    assert "outside allowed roots" in str(exc_info.value).lower()
 
 
 def test_no_allowed_roots_disables(config):
     cfg = RagConfig(allowed_repository_roots=())
     uc = _build_use_case(config=cfg)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         uc.execute(ModifyRepositoryRequest(repository_path="C:/x", request="x"))
+    assert "no allowed repository roots configured" in str(exc_info.value).lower()
+
+
+def test_configured_allowed_root_accepted(config, repo_root):
+    uc = _build_use_case(config=config)
+    result = uc.execute(ModifyRepositoryRequest(repository_path=str(repo_root), request="x", dry_run=True))
+    assert result.success is True
+    assert result.status == ModifyRepositoryStatus.PROPOSED
+
+
+def test_path_traversal_dot_dot_rejected(config, repo_root):
+    uc = _build_use_case(config=config)
+    traversal_path = str(repo_root / ".." / "other_target")
+    with pytest.raises(ValueError) as exc_info:
+        uc.execute(ModifyRepositoryRequest(repository_path=traversal_path, request="x"))
+    assert "outside allowed roots" in str(exc_info.value).lower()
+
+
+def test_symlink_escape_rejected_where_supported(config, repo_root, tmp_path):
+    uc = _build_use_case(config=config)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir(exist_ok=True)
+    symlink_path = repo_root / "symlink_escape"
+    try:
+        symlink_path.symlink_to(outside_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported in this environment")
+
+    with pytest.raises(ValueError) as exc_info:
+        uc.execute(ModifyRepositoryRequest(repository_path=str(symlink_path), request="x"))
+    assert "outside allowed roots" in str(exc_info.value).lower()
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,12 @@ from functools import lru_cache
 
 from pathlib import Path
 
+from typing import Any
+import json
+import re
+
 from dotenv import load_dotenv
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,7 +62,26 @@ class Settings(BaseSettings):
     # Allowed repository roots. A user-provided path must resolve inside one
     # of these or indexing is rejected. Empty by default (indexing disabled
     # until explicitly configured) for safety.
-    allowed_repository_roots: list[str] = []
+    allowed_repository_roots: list[str] | str = []
+
+    @field_validator("allowed_repository_roots", mode="after")
+    @classmethod
+    def _validate_allowed_repository_roots(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(p).strip() for p in parsed if str(p).strip()]
+                except Exception:
+                    pass
+            return [p.strip() for p in re.split(r"[,;\n]", v) if p.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(p).strip() for p in v if str(p).strip()]
+        return []
 
     model_config = SettingsConfigDict(env_prefix="")
 
