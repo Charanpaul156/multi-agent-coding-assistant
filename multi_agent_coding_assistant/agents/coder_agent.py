@@ -1,12 +1,21 @@
 """Coder Agent.
 
 This agent is responsible for translating a natural language programming
-request into Python source code.
+request into source code across various supported languages.
 
 It also provides ``generate_changes()`` for repository-aware code modification.
 In that mode the agent returns a structured ``ChangeSet`` (proposed changes)
 instead of a standalone code string. The agent NEVER writes files itself; it
 only proposes changes to be validated and applied by the infrastructure layer.
+
+RESPONSIBILITIES:
+- Multi-file code generation and repository-aware change proposal.
+- Astute repository context utilization.
+- Language and framework awareness with AST syntax verification.
+- Adherence to project conventions and clean architecture boundaries.
+- Minimizing unnecessary modifications to unrelated files.
+- Safe handling of incomplete or ambiguous requirements.
+- Producing structured modification summaries.
 
 IMPORTANT: This class must not contain Gemini-specific logic.
 It communicates ONLY through dependency-injected `LLMClient`.
@@ -14,11 +23,12 @@ It communicates ONLY through dependency-injected `LLMClient`.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from backend.infrastructure.llm_client import (
     LLMClient,
@@ -48,7 +58,7 @@ class CoderAgentError(RuntimeError):
 
 @dataclass(frozen=True)
 class CoderAgent:
-    """Generate Python code from prompts using an injected LLM client."""
+    """Generate Python and multi-language code from prompts using an injected LLM client."""
 
     llm_client: LLMClient
 
@@ -61,48 +71,28 @@ class CoderAgent:
         plan_summary: str | None = None,
         max_attempts: int = 2,
     ) -> ChangeSet:
-        """Propose a structured ChangeSet for repository-aware modification.
-
-        Args:
-            prompt: Natural language repository-modification request.
-            implementation_plan: Optional structured implementation plan. This
-                may be a dataclass, dict, or pre-rendered string.
-            retrieved_context: Optional repository context (pre-formatted by
-                the RAG layer). The agent never retrieves context internally.
-            plan_summary: Optional planner output to guide the changes.
-
-        Returns:
-            A ChangeSet containing full-file proposed changes (``create`` or
-            ``modify``). ``delete`` is not supported in v1.
-
-        Raises:
-            - TypeError/ValueError: invalid input.
-            - CoderAgentError: if the LLM returns invalid/irrecoverable JSON.
-        """
+        """Propose a structured ChangeSet for repository-aware modification."""
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         if not prompt.strip():
             raise ValueError("prompt must be non-empty")
 
         if plan_summary is None and implementation_plan is not None:
-            plan_summary = self._format_implementation_plan(
-                implementation_plan
-            )
+            plan_summary = self._format_implementation_plan(implementation_plan)
 
         system_prompt = (
-            "You are a senior software engineer performing repository-aware "
-            "modification.\n"
+            "You are a senior software engineer performing repository-aware modification.\n"
             "You do NOT write files. You only PROPOSE changes.\n"
             "You return ONLY valid JSON describing an array of file changes.\n"
+            "Follow existing project conventions, language idioms, and architectural layer separation.\n"
+            "Minimize unnecessary modifications: make targeted edits without modifying unrelated code or files.\n"
+            "If requirements are incomplete or ambiguous, apply safe, idiomatic, standard defaults.\n"
             "Each change must be an object with exactly:\n"
             "{\n"
-            "  \"file_path\": string (repository-relative POSIX path, e.g. "
-            "'backend/auth/service.py'),\n"
+            "  \"file_path\": string (repository-relative POSIX path, e.g. 'backend/auth/service.py'),\n"
             "  \"operation\": \"create\" or \"modify\",\n"
-            "  \"new_content\": string (COMPLETE new file content, full file, "
-            "no Markdown fences, no truncation),\n"
-            "  \"original_hash\": string | null (optional; include when the "
-            "current file hash is known),\n"
+            "  \"new_content\": string (COMPLETE new file content, full file, no Markdown fences, no truncation),\n"
+            "  \"original_hash\": string | null (optional; include when the current file hash is known),\n"
             "  \"description\": string (concise)\n"
             "}\n"
             "Return a JSON object with the shape:\n"
@@ -110,20 +100,14 @@ class CoderAgent:
             "RULES:\n"
             "- Use 'create' for new files, 'modify' for existing files.\n"
             "- NEVER use 'delete'.\n"
-            "- NEVER modify .env*, secrets, keys, credentials, tokens, "
-            "consent files, deployment credentials, or .git contents.\n"
+            "- NEVER modify .env*, secrets, keys, credentials, tokens, consent files, deployment credentials, or .git contents.\n"
             "- Use POSIX '/' separators; NEVER use absolute paths or '..'.\n"
-            "- Provide the COMPLETE file content for modified files, not a "
-            "patch or a partial diff. Preserve unrelated existing content.\n"
-            "- If the current file hash is known, include original_hash so the "
-            "application layer can reject stale changes safely.\n"
-            "- Do not include Markdown fences. Do not add explanations "
-            "outside JSON."
+            "- Provide the COMPLETE file content for modified files, not a patch or a partial diff. Preserve unrelated existing content.\n"
+            "- If the current file hash is known, include original_hash so the application layer can reject stale changes safely.\n"
+            "- Do not include Markdown fences. Do not add explanations outside JSON."
         )
 
-        user_prompt = self._build_changes_prompt(
-            prompt, retrieved_context, plan_summary
-        )
+        user_prompt = self._build_changes_prompt(prompt, retrieved_context, plan_summary)
 
         current_prompt = user_prompt
         last_error = ""
@@ -189,7 +173,7 @@ class CoderAgent:
                 last_error = str(exc)
                 is_recoverable_parse_error = any(
                     k in last_error.lower()
-                    for k in ("malformed", "truncated", "unterminated", "json")
+                    for k in ("malformed", "truncated", "unterminated", "json", "syntax error")
                 )
                 if not is_recoverable_parse_error:
                     logger.warning(
@@ -227,10 +211,10 @@ class CoderAgent:
 
                 current_prompt = (
                     f"{user_prompt}\n\n"
-                    f"[CORRECTION REQUIRED - INVALID JSON OUTPUT]\n"
-                    f"Your previous response was not valid JSON ({last_error}).{truncation_note}\n\n"
+                    f"[CORRECTION REQUIRED - INVALID OUTPUT]\n"
+                    f"Your previous response had issues: ({last_error}).{truncation_note}\n\n"
                     f"Return ONLY a valid JSON object matching the required ChangeSet schema.\n\n"
-                    f"Every file content must be a valid JSON string with correctly escaped quotes, "
+                    f"Every file content must be valid syntax with correctly escaped quotes, "
                     f"backslashes, and newlines.\n\n"
                     f"Do not use Markdown fences.\n"
                     f"Do not add explanations.\n"
@@ -249,21 +233,7 @@ class CoderAgent:
         language: str | None = None,
         max_attempts: int = 2,
     ) -> str:
-        """Generate code in the requested programming language.
-
-        Args:
-            prompt: Natural language programming request.
-            retrieved_context: Optional repository context (pre-formatted by
-                the RAG layer). Agents never retrieve context internally.
-            language: Optional explicit programming language (e.g., 'java', 'python').
-                If omitted or 'auto', language is extracted from the prompt.
-                Defaults to Python if unspecified.
-            max_attempts: Maximum generation attempts before failing on validation error.
-
-        Returns:
-            Source code only (no Markdown fences).
-        """
-
+        """Generate code in the requested programming language."""
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         if not prompt.strip():
@@ -374,7 +344,6 @@ class CoderAgent:
             response = self.llm_client.generate(prompt, **kwargs)
             return (response.text or "").strip()
         except TypeError:
-            # Fallback if injected fake client only accepts (prompt, system_prompt=...)
             response = self.llm_client.generate(prompt, system_prompt=system_prompt)
             return (response.text or "").strip()
         except (CoderAgentError, LLMStructuredOutputError):
@@ -417,7 +386,6 @@ class CoderAgent:
 
         cleaned = _strip_markdown_code_fences(text).strip()
 
-        # 1. Attempt standard JSON parsing first on cleaned text
         try:
             parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
@@ -428,7 +396,6 @@ class CoderAgent:
         except json.JSONDecodeError as err:
             first_err = err
 
-        # 2. Locate the intended outer JSON object safely without greedy arbitrary regex
         start_idx = cleaned.find("{")
         end_idx = cleaned.rfind("}")
 
@@ -446,7 +413,6 @@ class CoderAgent:
         else:
             parse_err = first_err
 
-        # 3. Detect malformed vs truncated JSON
         if self._is_truncated_json(cleaned, parse_err):
             raise CoderAgentError(
                 "Truncated JSON response from LLM: unterminated string or incomplete brackets."
@@ -460,41 +426,37 @@ class CoderAgent:
         if not isinstance(data, dict):
             raise CoderAgentError("ChangeSet payload must be a JSON object (dict)")
         if "changes" not in data or not isinstance(data["changes"], list):
-            raise CoderAgentError(
-                "changes field missing or not a list in change JSON"
-            )
+            raise CoderAgentError("changes field missing or not a list in change JSON")
         if not data["changes"]:
             raise CoderAgentError("changes list must not be empty")
 
         if len(data["changes"]) > 50:
             raise CoderAgentError("ChangeSet exceeds safe limit of 50 files per generation")
 
-        summary = data.get("summary", "")
-        if not isinstance(summary, str):
-            raise CoderAgentError("summary must be a string")
-
         changes: List[FileChange] = []
         for idx, item in enumerate(data["changes"]):
             changes.append(self._build_file_change(item, idx))
+
+        summary = data.get("summary", "")
+        if not isinstance(summary, str):
+            raise CoderAgentError("summary must be a string")
+        if not summary.strip():
+            created_cnt = sum(1 for c in changes if c.operation == ChangeOperation.CREATE)
+            modified_cnt = sum(1 for c in changes if c.operation == ChangeOperation.MODIFY)
+            summary = f"Proposed changes: created {created_cnt} file(s), modified {modified_cnt} file(s)."
 
         return ChangeSet(changes=changes, summary=summary)
 
     def _build_file_change(self, item: Any, idx: int) -> FileChange:
         if not isinstance(item, dict):
-            raise CoderAgentError(
-                f"change at index {idx} must be an object"
-            )
+            raise CoderAgentError(f"change at index {idx} must be an object")
         for key in ("file_path", "operation", "new_content"):
             if key not in item:
-                raise CoderAgentError(
-                    f"change at index {idx} missing field: {key}"
-                )
+                raise CoderAgentError(f"change at index {idx} missing field: {key}")
 
         for key in ("description",):
             if key not in item:
-                raise CoderAgentError(
-                    f"change at index {idx} missing field: {key}"
-                )
+                raise CoderAgentError(f"change at index {idx} missing field: {key}")
 
         file_path = item["file_path"]
         operation_raw = item["operation"]
@@ -503,9 +465,7 @@ class CoderAgent:
         original_hash = item.get("original_hash", None)
 
         if not isinstance(file_path, str) or not file_path.strip():
-            raise CoderAgentError(
-                f"change at index {idx} has invalid file_path"
-            )
+            raise CoderAgentError(f"change at index {idx} has invalid file_path")
         if (
             file_path.startswith("/")
             or file_path.startswith("\\")
@@ -518,13 +478,9 @@ class CoderAgent:
                 f"change at index {idx} has invalid or unsafe file_path: {file_path}"
             )
         if not isinstance(new_content, str) or not new_content.strip():
-            raise CoderAgentError(
-                f"change at index {idx} has invalid new_content"
-            )
+            raise CoderAgentError(f"change at index {idx} has invalid new_content")
         if len(new_content.encode("utf-8")) > 2_000_000:
-            raise CoderAgentError(
-                f"change at index {idx} exceeds maximum content size limit"
-            )
+            raise CoderAgentError(f"change at index {idx} exceeds maximum content size limit")
         if operation_raw not in ("create", "modify"):
             raise CoderAgentError(
                 f"change at index {idx} has unsupported operation: "
@@ -533,17 +489,20 @@ class CoderAgent:
         if "original_hash" in item and original_hash is not None and not isinstance(
             original_hash, str
         ):
-            raise CoderAgentError(
-                f"change at index {idx} has invalid original_hash"
-            )
+            raise CoderAgentError(f"change at index {idx} has invalid original_hash")
         if isinstance(original_hash, str) and not original_hash.strip():
-            raise CoderAgentError(
-                f"change at index {idx} has invalid original_hash"
-            )
+            raise CoderAgentError(f"change at index {idx} has invalid original_hash")
         if not isinstance(description, str):
-            raise CoderAgentError(
-                f"change at index {idx} has invalid description"
-            )
+            raise CoderAgentError(f"change at index {idx} has invalid description")
+
+        # AST syntax pre-validation for Python changes
+        if file_path.endswith(".py"):
+            try:
+                ast.parse(new_content, filename=file_path)
+            except SyntaxError as syn_err:
+                raise CoderAgentError(
+                    f"Python syntax error in '{file_path}': {syn_err.msg} (line {syn_err.lineno})"
+                )
 
         operation = ChangeOperation(operation_raw)
         return FileChange(
@@ -586,16 +545,12 @@ class CoderAgent:
 
 def _strip_markdown_code_fences(text: str) -> str:
     """Remove leading/trailing triple-backtick fences if present."""
-
     stripped = text.strip()
 
-    # Matches ```python ... ``` or ``` ... ```
     fence_match = re.match(r"^```(?:python)?\s*([\s\S]*?)\s*```$", stripped, flags=re.I)
     if fence_match:
         return fence_match.group(1)
 
-    # Fallback: remove start/end fences independently.
     stripped = re.sub(r"^```(?:python)?\s*", "", stripped, flags=re.I)
     stripped = re.sub(r"\s*```$", "", stripped)
     return stripped
-

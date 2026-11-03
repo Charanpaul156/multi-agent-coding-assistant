@@ -232,3 +232,24 @@ def test_generate_tests_prompt_contains_avoid_speculative_requirements_guidance(
     assert "Do not assume validation or error-handling behavior" in client.last_system_prompt
     assert "explicitly requested" in client.last_system_prompt
 
+
+
+def test_generate_tests_parses_integration_cases_and_missing_scenarios() -> None:
+    data = _valid_report_json()
+    data["integration_cases"] = [
+        {
+            "name": "test_integration_add_with_multiplier",
+            "description": "Integration test combining add and multiply",
+            "input_example": "multiply(add(2, 3), 4)",
+            "expected_behavior": "returns 20",
+        }
+    ]
+    data["missing_scenarios"] = ["Concurrency stress tests", "Memory allocation limits"]
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    report = agent.generate_tests("def add(a, b): return a + b")
+    assert len(report.integration_cases) == 1
+    assert report.integration_cases[0].name == "test_integration_add_with_multiplier"
+    assert len(report.missing_scenarios) == 2
+    assert "Concurrency stress tests" in report.missing_scenarios

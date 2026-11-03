@@ -7,6 +7,9 @@ RESPONSIBILITIES:
 - Analyze generated Python code.
 - Analyze optional execution results (stdout, stderr, exit code).
 - Provide structured, categorized feedback.
+- Identify security vulnerabilities and architectural violations.
+- Detect code duplication and maintainability risks.
+- Provide severity-based findings with line and file references where possible.
 
 STRICT CONSTRAINTS (must never be violated):
 - NEVER execute code.
@@ -23,9 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
 
 from backend.infrastructure.llm_client import LLMClient
 
@@ -37,12 +39,23 @@ class ReviewerAgentError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ReviewFinding:
+    """Individual severity-tagged code review finding."""
+
+    category: str  # security, performance, architecture, duplication, pep8, maintainability, logic
+    severity: str  # CRITICAL, HIGH, MEDIUM, LOW, INFO
+    message: str
+    file_path: Optional[str] = None
+    line_number: Optional[int] = None
+    suggestion: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ReviewReport:
     """Structured review report produced by the ReviewerAgent.
 
     Represents the output of a professional code review. Each field captures
-    a distinct review category to keep the report structured (no free-form
-    text dumping).
+    a distinct review category to keep the report structured.
     """
 
     overall_score: int
@@ -56,6 +69,9 @@ class ReviewReport:
     error_handling: List[str]
     recommendations: List[str]
     final_summary: str
+    findings: List[ReviewFinding] = field(default_factory=list)
+    architectural_violations: List[str] = field(default_factory=list)
+    code_duplications: List[str] = field(default_factory=list)
 
 
 class ReviewerAgent:
@@ -95,13 +111,7 @@ class ReviewerAgent:
 
         Returns:
             A structured ReviewReport.
-
-        Raises:
-            TypeError: If ``code`` is not a string.
-            ValueError: If ``code`` is empty.
-            ReviewerAgentError: If the LLM returns invalid/irrecoverable JSON.
         """
-
         if not isinstance(code, str):
             raise TypeError("code must be a string")
         if not code.strip():
@@ -114,6 +124,8 @@ class ReviewerAgent:
             "Do not rewrite the implementation.\n"
             "Only review and provide structured feedback.\n"
             "Never execute code. Never modify code. Only analyze.\n"
+            "Identify security concerns, performance problems, code duplication, "
+            "and architectural violations with line references where applicable.\n"
             "If there are no issues or concerns for a category, return an empty array [].\n"
             "Do not return placeholder strings such as:\n"
             "- \"None\"\n"
@@ -122,8 +134,7 @@ class ReviewerAgent:
             "- \"No security concerns\"\n"
             "- \"No logic issues\"\n"
             "- \"N/A\"\n"
-            "Return ONLY structured review information as valid JSON.\n"
-            "The JSON MUST match the following schema:\n"
+            "Return ONLY structured review information as valid JSON matching this schema:\n"
             "{\n"
             "  \"overall_score\": integer (0 to 100),\n"
             "  \"strengths\": string[],\n"
@@ -135,7 +146,18 @@ class ReviewerAgent:
             "  \"maintainability\": string[],\n"
             "  \"error_handling\": string[],\n"
             "  \"recommendations\": string[],\n"
-            "  \"final_summary\": string\n"
+            "  \"final_summary\": string,\n"
+            "  \"architectural_violations\": string[],\n"
+            "  \"code_duplications\": string[],\n"
+            "  \"findings\": [\n"
+            "    {\n"
+            "      \"category\": \"security\" | \"performance\" | \"architecture\" | \"logic\" | \"pep8\",\n"
+            "      \"severity\": \"CRITICAL\" | \"HIGH\" | \"MEDIUM\" | \"LOW\" | \"INFO\",\n"
+            "      \"message\": string,\n"
+            "      \"line_number\": integer | null,\n"
+            "      \"suggestion\": string | null\n"
+            "    }\n"
+            "  ]\n"
             "}\n"
             "Do not include markdown. Do not include explanations outside JSON."
         )
@@ -196,10 +218,7 @@ class ReviewerAgent:
         except ReviewerAgentError:
             raise
         except Exception as exc:
-            # malformed JSON or unexpected response shape
-            logger.warning(
-                "ReviewerAgent: failed first parse (%s); retrying once", exc
-            )
+            logger.warning("ReviewerAgent: failed first parse (%s); retrying once", exc)
             correction_prompt = (
                 "The previous response was not valid JSON matching the required "
                 "schema. Return ONLY corrected valid JSON matching the schema. "
@@ -211,9 +230,7 @@ class ReviewerAgent:
                 return self._validate_and_build_report(data_retry)
             except Exception as exc2:
                 logger.exception("ReviewerAgent: retry failed")
-                raise ReviewerAgentError(
-                    "Invalid review response from LLM"
-                ) from exc2
+                raise ReviewerAgentError("Invalid review response from LLM") from exc2
 
     def _call_llm(self, prompt: str, system_prompt: str) -> str:
         response = self._llm_client.generate(prompt, system_prompt=system_prompt)
@@ -222,7 +239,6 @@ class ReviewerAgent:
     def _parse_json(self, text: str) -> Dict[str, Any]:
         cleaned = _strip_markdown_code_fences(text).strip()
 
-        # Attempt direct JSON parse.
         try:
             parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
@@ -230,7 +246,6 @@ class ReviewerAgent:
         except json.JSONDecodeError:
             pass
 
-        # Last resort: extract the first JSON object.
         match = re.search(r"\{[\s\S]*\}", cleaned)
         if match:
             parsed = json.loads(match.group(0))
@@ -255,9 +270,7 @@ class ReviewerAgent:
         ]
         for field_name in required_fields:
             if field_name not in data:
-                raise ReviewerAgentError(
-                    f"Missing field in review JSON: {field_name}"
-                )
+                raise ReviewerAgentError(f"Missing field in review JSON: {field_name}")
 
         def as_str(value: Any) -> str:
             if not isinstance(value, str):
@@ -265,12 +278,8 @@ class ReviewerAgent:
             return value
 
         def as_str_list(value: Any) -> List[str]:
-            if not isinstance(value, list) or not all(
-                isinstance(x, str) for x in value
-            ):
-                raise ReviewerAgentError(
-                    "Expected list[string] fields in review"
-                )
+            if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                raise ReviewerAgentError("Expected list[string] fields in review")
             return value
 
         def _is_no_issue_placeholder(item: str) -> bool:
@@ -311,39 +320,75 @@ class ReviewerAgent:
                 normalized.append(stripped)
             return normalized
 
-        if not isinstance(data["overall_score"], int) or isinstance(
-            data["overall_score"], bool
-        ):
-            raise ReviewerAgentError(
-                "Expected integer for overall_score"
-            )
+        if not isinstance(data["overall_score"], int) or isinstance(data["overall_score"], bool):
+            raise ReviewerAgentError("Expected integer for overall_score")
         if not (0 <= data["overall_score"] <= 100):
-            raise ReviewerAgentError(
-                "overall_score must be between 0 and 100"
-            )
+            raise ReviewerAgentError("overall_score must be between 0 and 100")
+
+        pep8 = _normalize_issue_list(data["pep8_issues"])
+        security = _normalize_issue_list(data["security_concerns"])
+        logic = _normalize_issue_list(data["logic_issues"])
+        weaknesses = as_str_list(data["weaknesses"])
+        perf = as_str_list(data["performance_suggestions"])
+
+        # Parse or synthesize structured findings
+        findings: List[ReviewFinding] = []
+        if "findings" in data and isinstance(data["findings"], list):
+            for f in data["findings"]:
+                if isinstance(f, dict) and "message" in f:
+                    findings.append(
+                        ReviewFinding(
+                            category=str(f.get("category", "general")),
+                            severity=str(f.get("severity", "MEDIUM")).upper(),
+                            message=str(f.get("message", "")),
+                            file_path=f.get("file_path"),
+                            line_number=f.get("line_number"),
+                            suggestion=f.get("suggestion"),
+                        )
+                    )
+        else:
+            # Backward-compatible synthesis
+            for sec in security:
+                findings.append(ReviewFinding(category="security", severity="HIGH", message=sec))
+            for log in logic:
+                findings.append(ReviewFinding(category="logic", severity="HIGH", message=log))
+            for p in perf:
+                findings.append(ReviewFinding(category="performance", severity="MEDIUM", message=p))
+            for p8 in pep8:
+                findings.append(ReviewFinding(category="pep8", severity="LOW", message=p8))
+
+        arch_violations = (
+            as_str_list(data["architectural_violations"])
+            if "architectural_violations" in data and isinstance(data["architectural_violations"], list)
+            else []
+        )
+        duplications = (
+            as_str_list(data["code_duplications"])
+            if "code_duplications" in data and isinstance(data["code_duplications"], list)
+            else []
+        )
 
         return ReviewReport(
             overall_score=data["overall_score"],
             strengths=as_str_list(data["strengths"]),
-            weaknesses=as_str_list(data["weaknesses"]),
-            pep8_issues=_normalize_issue_list(data["pep8_issues"]),
-            performance_suggestions=as_str_list(
-                data["performance_suggestions"]
-            ),
-            security_concerns=_normalize_issue_list(data["security_concerns"]),
-            logic_issues=_normalize_issue_list(data["logic_issues"]),
+            weaknesses=weaknesses,
+            pep8_issues=pep8,
+            performance_suggestions=perf,
+            security_concerns=security,
+            logic_issues=logic,
             maintainability=as_str_list(data["maintainability"]),
             error_handling=as_str_list(data["error_handling"]),
             recommendations=as_str_list(data["recommendations"]),
             final_summary=as_str(data["final_summary"]),
+            findings=findings,
+            architectural_violations=arch_violations,
+            code_duplications=duplications,
         )
 
 
 def _strip_markdown_code_fences(text: str) -> str:
     """Remove leading/trailing triple-backtick fences if present."""
-
     stripped = text.strip()
-
     fence_match = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", stripped, flags=re.I)
     if fence_match:
         return fence_match.group(1)

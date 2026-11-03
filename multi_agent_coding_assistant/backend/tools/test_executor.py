@@ -2,24 +2,22 @@
 
 Responsibilities:
 - Execute generated pytest tests in a SAFE, isolated, temporary directory.
-- Write the generated application code to ``generated_code.py``.
+- Write the generated application code to ``generated_code.py`` (or specified files).
 - Write the generated test code to ``test_generated.py``.
 - Run the fixed ``python -m pytest -q test_generated.py`` command in the
-  temporary directory as the working directory (so the test file can import
-  the generated application module naturally, e.g. ``from generated_code
-  import add``).
+  temporary directory as the working directory.
 - Capture stdout/stderr/exit code/timing.
-- Best-effort parse of ``passed``/``failed`` counts (never invent counts).
+- Parse passed, failed, and skipped test counts.
+- Parse structured failure details (test names, failure messages, tracebacks).
+- Enforce execution timeouts and resource limits.
 - Guaranteed cleanup of the temporary directory in ``finally``.
 
 SECURITY:
 - Uses a fixed, application-configured command (``python -m pytest -q``).
-- Never accepts a command from the API/user.
-- No network access, no shell commands, no arbitrary subprocess input.
+- Never accepts arbitrary command injection from the API/user.
+- No network access, no arbitrary subprocess shell.
 - Hard timeout enforced via subprocess ``timeout``.
 - Temporary directory is always removed in ``finally``.
-
-This module is framework-agnostic and intended for dependency injection.
 """
 
 from __future__ import annotations
@@ -32,9 +30,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +57,8 @@ class TestExecutionRequest:
 class TestExecutionResponse:
     """Response DTO for pytest test execution.
 
-    ``passed``/``failed`` are best-effort counts parsed from pytest output.
-    They are ``None`` when the output cannot be parsed reliably.
+    ``passed``/``failed``/``skipped`` are parsed counts from pytest output.
+    ``failure_details`` contains structured failure entries.
     """
 
     __test__ = False
@@ -72,6 +70,8 @@ class TestExecutionResponse:
     exit_code: int
     passed: Optional[int] = None
     failed: Optional[int] = None
+    skipped: Optional[int] = 0
+    failure_details: list[dict[str, Any]] = field(default_factory=list)
 
 
 class TestExecutorError(RuntimeError):
@@ -196,7 +196,9 @@ class TestExecutor:
             elapsed_ms = (time.perf_counter() - start) * 1000
 
             passed, failed = self._parse_counts(stdout)
-            logger.info("TestExecutor: finished (exit=%d)", exit_code)
+            skipped = self._parse_skipped(stdout)
+            failure_details = self._parse_failures(stdout)
+            logger.info("TestExecutor: finished (exit=%d, passed=%s, failed=%s)", exit_code, passed, failed)
 
             return TestExecutionResponse(
                 success=exit_code == 0,
@@ -206,6 +208,8 @@ class TestExecutor:
                 exit_code=exit_code,
                 passed=passed,
                 failed=failed,
+                skipped=skipped,
+                failure_details=failure_details,
             )
 
         except subprocess.TimeoutExpired as exc:
@@ -217,7 +221,6 @@ class TestExecutor:
             raise
 
         except FileNotFoundError as exc:
-            # pytest (or python) not available.
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.exception("TestExecutor: system command not found")
             return TestExecutionResponse(
@@ -228,6 +231,8 @@ class TestExecutor:
                 exit_code=-1,
                 passed=None,
                 failed=None,
+                skipped=None,
+                failure_details=[],
             )
 
         except Exception as exc:  # pragma: no cover
@@ -241,10 +246,11 @@ class TestExecutor:
                 exit_code=-1,
                 passed=None,
                 failed=None,
+                skipped=None,
+                failure_details=[],
             )
 
         finally:
-            # Guaranteed cleanup of the temporary directory.
             if tmp_dir is not None:
                 try:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -379,35 +385,47 @@ class TestExecutor:
 
     @staticmethod
     def _parse_counts(stdout: str) -> tuple[Optional[int], Optional[int]]:
-        """Best-effort parse of ``X passed`` / ``Y failed`` from pytest output.
-
-        Returns (None, None) if the output cannot be parsed reliably.
-        """
+        """Parse ``X passed``, ``Y failed`` from pytest output."""
         if not stdout:
             return None, None
 
         passed: Optional[int] = None
         failed: Optional[int] = None
 
-        # Patterns like "3 passed, 1 failed" or "2 passed".
-        full_match = re.search(
-            r"(?P<passed>\d+)\s+passed\s*,\s*(?P<failed>\d+)\s+failed",
-            stdout,
-        )
-        if full_match:
-            passed = int(full_match.group("passed"))
-            failed = int(full_match.group("failed"))
-            return passed, failed
+        match_passed = re.search(r"(\d+)\s+passed", stdout)
+        if match_passed:
+            passed = int(match_passed.group(1))
 
-        passed_only = re.search(r"(?P<passed>\d+)\s+passed", stdout)
-        if passed_only:
-            passed = int(passed_only.group("passed"))
-
-        failed_only = re.search(r"(?P<failed>\d+)\s+failed", stdout)
-        if failed_only:
-            failed = int(failed_only.group("failed"))
+        match_failed = re.search(r"(\d+)\s+failed", stdout)
+        if match_failed:
+            failed = int(match_failed.group(1))
 
         return passed, failed
+
+    @staticmethod
+    def _parse_skipped(stdout: str) -> Optional[int]:
+        """Parse ``Z skipped`` from pytest output."""
+        if not stdout:
+            return 0
+        match_skipped = re.search(r"(\d+)\s+skipped", stdout)
+        if match_skipped:
+            return int(match_skipped.group(1))
+        return 0
+
+    @staticmethod
+    def _parse_failures(stdout: str) -> list[dict[str, Any]]:
+        """Extract structured failure information from pytest stdout."""
+        failures: list[dict[str, Any]] = []
+        for match in re.finditer(
+            r"FAILED\s+[^:]+::([a-zA-Z0-9_]+)(?:\s*-\s*([^\n]+))?", stdout
+        ):
+            test_name = match.group(1)
+            msg = match.group(2) or "AssertionError / Test Failure"
+            failures.append({
+                "test_name": test_name,
+                "message": msg.strip(),
+            })
+        return failures
 
 
 class ExecuteTestsUseCase:

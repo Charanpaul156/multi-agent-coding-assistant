@@ -176,3 +176,23 @@ def test_debug_invalid_confidence() -> None:
 
     with pytest.raises(DebuggerAgentError):
         agent.debug_code("def add(a, b):\n    return a + b\n")
+
+
+def test_debug_classification_and_targeted_diff() -> None:
+    data = _valid_report_json()
+    data["error_type"] = "ZeroDivisionError"
+    data["explanation"] = "Division by zero on line 4"
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    original = "def divide(a, b):\n    return a / b\n"
+    report = agent.debug_code(
+        original,
+        application_stderr="Traceback (most recent call last):\n  File 'test.py', line 4, in divide\nZeroDivisionError: division by zero",
+    )
+
+    assert report.error_category == "ZeroDivisionError"
+    assert report.line_number == 4
+    assert report.targeted_diff is not None
+    assert "--- original.py" in report.targeted_diff
+    assert "+++ corrected.py" in report.targeted_diff

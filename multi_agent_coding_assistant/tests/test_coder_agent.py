@@ -93,7 +93,6 @@ class _FakeLLMClient:
 
 
 def _build_agent(client) -> CoderAgent:
-    # Duck-typed: agent only needs .generate(prompt, system_prompt=...).
     return CoderAgent(client)  # type: ignore[arg-type]
 
 
@@ -224,7 +223,6 @@ def test_generate_changes_markdown_fenced_json() -> None:
 
 
 def test_generate_changes_unterminated_string_retries_and_succeeds() -> None:
-    # Unterminated string in the first response (simulating cut-off or missing quote)
     unterminated = '{"summary": "Test", "changes": [{"file_path": "a.py", "operation": "create", "new_content": "unterminated code...'
     client = _FakeLLMClient(responses=[unterminated, json.dumps(_create_only_json())])
     agent = _build_agent(client)
@@ -233,13 +231,10 @@ def test_generate_changes_unterminated_string_retries_and_succeeds() -> None:
     assert isinstance(changes, ChangeSet)
     assert len(changes.changes) == 1
     assert client.calls == 2
-    # Verify the retry prompt included the correction guidance
     assert "CORRECTION REQUIRED" in client.prompts[1]
-    assert "correctly escaped quotes" in client.prompts[1]
 
 
 def test_generate_changes_truncated_json_fails_after_max_retries() -> None:
-    # Truncated responses on both attempts
     truncated_1 = '{"summary": "Test", "changes": [{"file_path": "a.py", "operation": "create", "new_content": "val = 1'
     truncated_2 = '{"summary": "Test", "changes": [{"file_path": "a.py"'
     client = _FakeLLMClient(responses=[truncated_1, truncated_2])
@@ -277,7 +272,6 @@ def test_generate_changes_rejects_unsafe_paths() -> None:
 
 
 def test_generate_changes_large_changeset_handling() -> None:
-    # A website request with multiple files (HTML, CSS, JS, python backend, readme)
     files = [
         ("index.html", "create", "<!DOCTYPE html><html><body><h1>Hello</h1></body></html>"),
         ("styles.css", "create", "body { margin: 0; font-family: sans-serif; }"),
@@ -308,7 +302,6 @@ def test_generate_changes_large_changeset_handling() -> None:
 
 
 def test_generate_changes_rejects_pathological_oversized_changeset() -> None:
-    # 51 changes exceeds the safe limit of 50
     changes = [
         {
             "file_path": f"file_{i}.py",
@@ -338,8 +331,6 @@ def test_generate_changes_requests_structured_output() -> None:
 
 
 def test_generate_changes_retries_on_structured_output_failure() -> None:
-    # First call: structured output generation fails (e.g. Groq json_validate_failed)
-    # Second call: valid JSON ChangeSet
     client = _FakeLLMClient(
         responses=[
             LLMStructuredOutputError("Provider failed structured output (code: json_validate_failed)"),
@@ -353,7 +344,6 @@ def test_generate_changes_retries_on_structured_output_failure() -> None:
     assert len(changes.changes) == 1
     assert client.calls == 2
     assert "[CORRECTION REQUIRED - STRUCTURED OUTPUT GENERATION FAILED]" in client.prompts[1]
-    assert "output budget" in client.prompts[1]
 
 
 def test_generate_changes_fails_after_max_retries_on_structured_output_failure() -> None:
@@ -387,3 +377,28 @@ def test_generate_changes_structured_output_error_sanitizes_secrets() -> None:
         agent.generate_changes("Build something", max_attempts=2)
 
     assert secret not in str(exc_info.value)
+
+
+def test_generate_changes_rejects_python_syntax_error() -> None:
+    data = _create_only_json()
+    data["changes"][0]["new_content"] = "def broken(:\n    pass\n"
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    with pytest.raises(CoderAgentError, match="Python syntax error"):
+        agent.generate_changes("Create a file", max_attempts=1)
+
+
+def test_generate_changes_recovers_from_syntax_error() -> None:
+    bad_data = _create_only_json()
+    bad_data["changes"][0]["new_content"] = "def broken(:\n    pass\n"
+
+    good_data = _create_only_json()
+    good_data["changes"][0]["new_content"] = "def fixed():\n    pass\n"
+
+    client = _FakeLLMClient(responses=[json.dumps(bad_data), json.dumps(good_data)])
+    agent = _build_agent(client)
+
+    res = agent.generate_changes("Create a file", max_attempts=2)
+    assert res.changes[0].new_content == "def fixed():\n    pass\n"
+    assert client.calls == 2

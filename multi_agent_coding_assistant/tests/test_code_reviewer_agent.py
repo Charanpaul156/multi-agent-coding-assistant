@@ -157,3 +157,29 @@ def test_reviewer_prompt_instructs_empty_array_for_no_issues() -> None:
     assert "empty array []" in client.last_system_prompt
     assert "None" in client.last_system_prompt
     assert "No issues" in client.last_system_prompt
+
+
+def test_reviewer_parses_findings_and_architectural_violations() -> None:
+    data = _valid_review_dict()
+    data["architectural_violations"] = ["Presentation layer directly queries database"]
+    data["code_duplications"] = ["Duplicate password hash logic found in 2 functions"]
+    data["findings"] = [
+        {
+            "category": "security",
+            "severity": "CRITICAL",
+            "message": "Hardcoded secret key in config",
+            "line_number": 42,
+            "suggestion": "Read from environment variable",
+        }
+    ]
+    client = _FakeLLMClient(responses=[json.dumps(data)])
+    agent = _build_agent(client)
+
+    report = agent.review_code("def secret(): return 'my-secret'")
+    assert len(report.architectural_violations) == 1
+    assert "Presentation layer" in report.architectural_violations[0]
+    assert len(report.code_duplications) == 1
+    assert len(report.findings) == 1
+    assert report.findings[0].severity == "CRITICAL"
+    assert report.findings[0].line_number == 42
+

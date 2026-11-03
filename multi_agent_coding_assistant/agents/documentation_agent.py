@@ -1,22 +1,21 @@
 """Documentation Agent.
 
 This agent is responsible for analyzing Python source code and optional
-retrieved context and producing a comprehensive, structured documentation
-report (``DocumentationReport``).
+retrieved context and producing comprehensive, structured documentation
+reports (``DocumentationReport``), README files, API references, and architecture guides.
 
 RESPONSIBILITIES:
-- Analyze Python source code.
+- Analyze Python source code and repository structure.
 - Understand functions, classes, signatures, and expected behavior.
-- Incorporate optional retrieved repository context.
-- Produce structured documentation including module description, function docs,
-  class docs, usage examples, and clean markdown documentation.
+- Generate structured module, function, and class documentation.
+- Generate and update repository README files.
+- Generate architectural and API documentation.
+- Update documentation following approved code modifications.
 
 STRICT CONSTRAINTS (must never be violated):
-- NEVER write files to disk.
-- NEVER execute code.
-- NEVER run shell commands.
-- NEVER access the filesystem.
-- NEVER access ChromaDB directly.
+- NEVER write files to disk directly.
+- NEVER execute code or run shell commands.
+- NEVER access the filesystem or ChromaDB directly.
 - It communicates ONLY through the dependency-injected ``LLMClient``.
 """
 
@@ -39,11 +38,7 @@ class DocumentationAgentError(RuntimeError):
 
 @dataclass(frozen=True)
 class DocumentationReport:
-    """Structured documentation report produced by the DocumentationAgent.
-
-    Contains structured breakdowns of module purpose, function and class
-    documentation, practical usage examples, and complete formatted markdown.
-    """
+    """Structured documentation report produced by the DocumentationAgent."""
 
     summary: str
     module_description: str
@@ -54,11 +49,7 @@ class DocumentationReport:
 
 
 class DocumentationAgent:
-    """Produce a structured DocumentationReport from Python code and optional context.
-
-    The agent only analyzes code and produces documentation. It never executes
-    code, runs shell commands, accesses the filesystem, or touches vector stores.
-    """
+    """Produce structured documentation from code and context."""
 
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client = llm_client
@@ -67,29 +58,22 @@ class DocumentationAgent:
     def llm_client(self) -> LLMClient:
         return self._llm_client
 
+    def run(
+        self,
+        code: str,
+        *,
+        retrieved_context: Optional[str] = None,
+    ) -> DocumentationReport:
+        """Execute documentation generation (backward-compatible alias)."""
+        return self.generate_documentation(code, retrieved_context=retrieved_context)
+
     def generate_documentation(
         self,
         code: str,
         *,
         retrieved_context: Optional[str] = None,
     ) -> DocumentationReport:
-        """Generate structured documentation for the provided Python code.
-
-        Args:
-            code: The Python source code to analyze and document (required).
-            retrieved_context: Optional context retrieved from the repository
-                (e.g., via RAG) to aid documentation.
-
-        Returns:
-            A structured DocumentationReport.
-
-        Raises:
-            TypeError: If ``code`` is not a string or ``retrieved_context`` is
-                not a string when provided.
-            ValueError: If ``code`` is empty or only whitespace.
-            DocumentationAgentError: If the LLM call fails or returns malformed
-                or invalid documentation.
-        """
+        """Generate structured documentation for the provided Python code."""
         if not isinstance(code, str):
             raise TypeError("code must be a string")
         if not code.strip():
@@ -146,8 +130,6 @@ class DocumentationAgent:
             data = self._parse_json(raw_text)
             return self._validate_and_build_report(data)
         except DocumentationAgentError as exc:
-            # Only malformed JSON triggers a single retry attempt.
-            # Missing fields or validation errors fail fast.
             if "malformed" not in str(exc).lower():
                 raise
             logger.warning(
@@ -156,10 +138,10 @@ class DocumentationAgent:
             correction_prompt = (
                 "The previous response was not valid JSON matching the required "
                 "schema. Return ONLY corrected valid JSON matching the schema. "
-                "Do not add explanations."
+                "Do not add explanations or markdown code fences."
             )
+            raw_text_retry = self._call_llm(correction_prompt, system_prompt)
             try:
-                raw_text_retry = self._call_llm(correction_prompt, system_prompt)
                 data_retry = self._parse_json(raw_text_retry)
                 return self._validate_and_build_report(data_retry)
             except Exception as exc2:
@@ -168,36 +150,82 @@ class DocumentationAgent:
                     "Invalid documentation response from LLM"
                 ) from exc2
 
-    def run(
+    def generate_readme(
         self,
-        code: str,
-        *,
-        retrieved_context: Optional[str] = None,
-    ) -> DocumentationReport:
-        """Alias for generate_documentation to support existing callers."""
-        return self.generate_documentation(
-            code, retrieved_context=retrieved_context
+        repository_name: str,
+        description: str,
+        files_summary: List[Dict[str, Any]],
+        existing_readme: Optional[str] = None,
+    ) -> str:
+        """Generate a complete repository README in Markdown."""
+        system_prompt = (
+            "You are a Principal Software Engineer and Technical Writer.\n"
+            "Create a clean, production-grade README.md for the repository.\n"
+            "Include: Project Overview, Architecture, Key Modules, Setup & Installation, Usage, and Testing.\n"
+            "Preserve existing documentation context where appropriate.\n"
+            "Return ONLY the README markdown content without code fences surrounding the whole document."
         )
+        prompt = (
+            f"Repository: {repository_name}\n"
+            f"Description: {description}\n"
+            f"Indexed Modules: {json.dumps(files_summary, indent=2)}\n"
+        )
+        if existing_readme:
+            prompt += f"\nExisting README:\n{existing_readme}\n"
+
+        response = self._llm_client.generate(prompt, system_prompt=system_prompt)
+        return _strip_markdown_code_fences(response.text or "")
+
+    def generate_architecture_docs(
+        self,
+        structure: Dict[str, Any],
+        tech_stack: List[str],
+    ) -> str:
+        """Generate architectural documentation for the codebase."""
+        system_prompt = (
+            "You are an Enterprise Software Architect.\n"
+            "Generate an Architecture Specification in Markdown.\n"
+            "Include: High-level System Design, Layer Separation (API, Application, Domain, Infrastructure), "
+            "Data Flow, Integration Boundaries, and Design Tradeoffs."
+        )
+        prompt = f"Tech Stack: {', '.join(tech_stack)}\nStructure:\n{json.dumps(structure, indent=2)}"
+        response = self._llm_client.generate(prompt, system_prompt=system_prompt)
+        return _strip_markdown_code_fences(response.text or "")
+
+    def update_documentation_for_changes(
+        self,
+        change_summary: str,
+        current_documentation: str,
+    ) -> str:
+        """Update existing documentation to reflect newly approved changes."""
+        system_prompt = (
+            "You are an expert technical documentation maintainer.\n"
+            "Update the existing documentation to accurately reflect the changes described in the summary.\n"
+            "Preserve unrelated existing sections, formatting, and style.\n"
+            "Return the updated markdown documentation."
+        )
+        prompt = (
+            f"Change Summary:\n{change_summary}\n\n"
+            f"Current Documentation:\n{current_documentation}"
+        )
+        response = self._llm_client.generate(prompt, system_prompt=system_prompt)
+        return _strip_markdown_code_fences(response.text or "")
 
     def _build_user_prompt(
-        self, code: str, retrieved_context: Optional[str] = None
+        self, code: str, retrieved_context: Optional[str]
     ) -> str:
-        prompt_parts: List[str] = []
-        if retrieved_context and retrieved_context.strip():
-            prompt_parts.append(
-                "### Retrieved Context:\n"
-                f"{retrieved_context.strip()}"
+        user_prompt = "Generate documentation for the following Python code:\n\n"
+        user_prompt += "```python\n" + code + "\n```\n"
+
+        if retrieved_context is not None and retrieved_context.strip():
+            user_prompt += (
+                "\n\nThe following repository context was retrieved to assist "
+                "in understanding the code:\n\n"
+                + retrieved_context.strip()
+                + "\n"
             )
-        prompt_parts.append(
-            "### Python Code to Document:\n"
-            "```python\n"
-            f"{code.strip()}\n"
-            "```"
-        )
-        prompt_parts.append(
-            "Analyze the code above and return comprehensive documentation as a single JSON object."
-        )
-        return "\n\n".join(prompt_parts)
+
+        return user_prompt
 
     def _call_llm(self, prompt: str, system_prompt: str) -> str:
         try:
@@ -215,7 +243,6 @@ class DocumentationAgent:
     def _parse_json(self, text: str) -> Dict[str, Any]:
         cleaned = _strip_markdown_code_fences(text).strip()
 
-        # Attempt direct JSON parse
         try:
             parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
@@ -223,7 +250,6 @@ class DocumentationAgent:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: extract the first JSON object using regex
         match = re.search(r"\{[\s\S]*\}", cleaned)
         if match:
             try:
@@ -293,7 +319,6 @@ class DocumentationAgent:
 
 
 def _strip_markdown_code_fences(text: str) -> str:
-    """Remove leading/trailing triple-backtick fences if present."""
     stripped = text.strip()
 
     fence_match = re.match(

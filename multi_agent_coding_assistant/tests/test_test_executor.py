@@ -349,3 +349,21 @@ def test_multi_file_does_not_inject_generated_code_fallback(monkeypatch) -> None
     assert written_test_content is not None
     assert "from generated_code import *" not in written_test_content
 
+
+
+def test_test_executor_parses_skipped_and_failure_details() -> None:
+    executor = TestExecutor()
+    sample_stdout = (
+        "FAILED test_generated.py::test_division - ZeroDivisionError: division by zero\n"
+        "2 passed, 1 failed, 1 skipped in 0.05s"
+    )
+    passed, failed = executor._parse_counts(sample_stdout)
+    skipped = executor._parse_skipped(sample_stdout)
+    failures = executor._parse_failures(sample_stdout)
+
+    assert passed == 2
+    assert failed == 1
+    assert skipped == 1
+    assert len(failures) == 1
+    assert failures[0]["test_name"] == "test_division"
+    assert "ZeroDivisionError" in failures[0]["message"]
