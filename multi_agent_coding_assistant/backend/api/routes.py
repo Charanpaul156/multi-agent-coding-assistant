@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from backend.api.deps import (
     get_debug_code_use_case,
+    get_advanced_orchestrator,
     get_coder_agent,
     get_event_bus,
     get_execute_code_use_case,
@@ -35,14 +37,21 @@ from backend.api.deps import (
     get_search_repository_use_case,
 )
 from backend.api.job_schemas import (
+    AdvancedOrchestrationJobPayload,
     CreateJobResponse,
     CreateWorkflowJobPayload,
     JobStatusApiResponse,
+    serialize_orchestration_result,
     serialize_workflow_result,
 )
+from backend.application.advanced_orchestration_jobs import (
+    run_advanced_orchestration_job,
+)
+from backend.application.advanced_orchestrator import AdvancedOrchestrator
 from backend.application.event_emitter import EventEmitter
 from backend.application.job_manager import JobManager
 from backend.application.job_runner import JobRunner
+from backend.domain.orchestration_models import OrchestrationResult
 from backend.domain.job_models import JobStatus, WorkflowEvent, WorkflowJob
 from backend.infrastructure.event_bus import EventBus
 from backend.application.use_cases import GenerateCodeRequest, GenerateCodeUseCase
@@ -1440,6 +1449,91 @@ def get_workflow_job_status(
     )
 
 
+@router.post(
+    "/advanced-orchestration/jobs",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["jobs"],
+)
+def create_advanced_orchestration_job(
+    payload: AdvancedOrchestrationJobPayload,
+    background_tasks: BackgroundTasks,
+    job_runner: JobRunner = Depends(get_job_runner),
+    orchestrator: AdvancedOrchestrator = Depends(get_advanced_orchestrator),
+) -> CreateJobResponse:
+    """Submit an advanced orchestration run as a background job.
+
+    A normally returned ``OrchestrationResult`` completes the job regardless
+    of its ``success`` value; clients inspect the result for orchestration
+    outcome. Repository changes are not applied by this endpoint.
+    """
+    prompt = payload.prompt.strip()
+    files_input = payload.files_input
+    job = job_runner.create_job(
+        metadata={
+            "job_type": "advanced_orchestration",
+            "mode": payload.mode.value,
+            "prompt_length": len(prompt),
+            "code_input_length": len(payload.code_input or ""),
+            "files_count": len(files_input or {}),
+            "files_total_chars": sum(len(content) for content in (files_input or {}).values()),
+        }
+    )
+    background_tasks.add_task(
+        run_advanced_orchestration_job,
+        job_runner,
+        orchestrator,
+        job.job_id,
+        mode=payload.mode,
+        prompt=prompt,
+        code_input=payload.code_input,
+        files_input=files_input,
+        repository_path=payload.repository_path,
+        language=payload.language,
+    )
+    return CreateJobResponse(job_id=job.job_id, status=job.status.value)
+
+
+@router.get(
+    "/advanced-orchestration/jobs/{job_id}",
+    response_model=JobStatusApiResponse,
+    tags=["jobs"],
+)
+def get_advanced_orchestration_job_status(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+) -> JobStatusApiResponse:
+    """Return lifecycle state and serialized result for an advanced job."""
+    cleaned_id = (job_id or "").strip()
+    if not cleaned_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_manager.get_job(cleaned_id)
+    if job is None or job.metadata.get("job_type") != "advanced_orchestration":
+        raise HTTPException(status_code=404, detail=f"Job not found: {cleaned_id}")
+
+    if job.result is None:
+        result_data = None
+    elif isinstance(job.result, OrchestrationResult):
+        result_data = serialize_orchestration_result(job.result)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored advanced orchestration result has an invalid type",
+        )
+
+    return JobStatusApiResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        result=result_data,
+        error=job.error,
+        metadata=dict(job.metadata),
+    )
+
+
 _TERMINAL_EVENT_TYPES = frozenset(
     {"job_completed", "job_failed", "workflow_failed", "workflow_completed"}
 )
@@ -1448,16 +1542,57 @@ _TERMINAL_EVENT_TYPES = frozenset(
 def _format_sse_event(event: WorkflowEvent) -> str:
     """Serialize a WorkflowEvent to standard SSE wire format ending with double newline."""
     payload_dict = event.to_dict()
-    # Defense-in-depth: ensure no approval tokens or credentials leak in event stream
-    if isinstance(payload_dict.get("payload"), dict):
-        sanitized_payload = {
-            k: v
-            for k, v in payload_dict["payload"].items()
-            if k not in {"approval_token", "ticket_token", "token"}
-        }
-        payload_dict["payload"] = sanitized_payload
+    payload_dict["payload"] = _sanitize_sse_value(payload_dict.get("payload", {}))
     data_str = json.dumps(payload_dict, ensure_ascii=False)
     return f"event: {event.event_type}\ndata: {data_str}\n\n"
+
+
+_SENSITIVE_SSE_FIELDS = frozenset(
+    {
+        "approval_token",
+        "ticket_token",
+        "token",
+        "secret",
+        "credential",
+        "api_key",
+        "access_key",
+        "private_key",
+        "password",
+        "authorization",
+        "prompt",
+        "prompt_text",
+        "code",
+        "code_input",
+        "generated_code",
+        "source",
+        "source_code",
+    }
+)
+
+
+def _sanitize_sse_value(value: Any) -> Any:
+    """Recursively remove sensitive fields from event payload structures."""
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, nested_value in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if (
+                normalized_key in _SENSITIVE_SSE_FIELDS
+                or normalized_key.endswith("_token")
+                or "secret" in normalized_key
+                or "credential" in normalized_key
+                or "api_key" in normalized_key
+                or "access_key" in normalized_key
+                or "private_key" in normalized_key
+                or "password" in normalized_key
+                or "authorization" in normalized_key
+            ):
+                continue
+            sanitized[str(key)] = _sanitize_sse_value(nested_value)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_sse_value(item) for item in value]
+    return value
 
 
 def _create_terminal_event(job: WorkflowJob) -> WorkflowEvent:
@@ -1576,4 +1711,34 @@ async def stream_workflow_events(
         event_stream(),
         media_type="text/event-stream",
         headers=sse_headers,
+    )
+
+
+@router.get(
+    "/advanced-orchestration/jobs/{job_id}/stream",
+    tags=["jobs"],
+    response_class=StreamingResponse,
+)
+async def stream_advanced_orchestration_events(
+    job_id: str,
+    request: Request,
+    job_manager: JobManager = Depends(get_job_manager),
+    event_bus: EventBus = Depends(get_event_bus),
+) -> StreamingResponse:
+    """Stream events only for a known advanced orchestration job."""
+    cleaned_id = (job_id or "").strip()
+    if not cleaned_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_manager.get_job(cleaned_id)
+    if job is None or job.metadata.get("job_type") != "advanced_orchestration":
+        raise HTTPException(status_code=404, detail=f"Job not found: {cleaned_id}")
+
+    # Reuse the established SSE lifecycle, including job-scoped subscription,
+    # already-terminal handling, keep-alives, disconnect checks, and cleanup.
+    return await stream_workflow_events(
+        cleaned_id,
+        request,
+        job_manager,
+        event_bus,
     )

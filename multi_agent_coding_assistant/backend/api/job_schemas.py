@@ -10,9 +10,15 @@ never leak through the public job API.
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, Field
+
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from backend.domain.orchestration_models import OrchestrationResult, WorkflowMode
 
 
 class CreateWorkflowJobPayload(BaseModel):
@@ -42,6 +48,64 @@ class JobStatusApiResponse(BaseModel):
     result: Any | None = None
     error: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdvancedOrchestrationJobPayload(BaseModel):
+    """Validated inputs for one advanced orchestration job."""
+
+    mode: WorkflowMode
+    prompt: str = Field(..., min_length=1)
+    code_input: str | None = None
+    files_input: dict[str, str] | None = None
+    repository_path: str | None = None
+    language: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mode_inputs(self) -> "AdvancedOrchestrationJobPayload":
+        if self.mode in {
+            WorkflowMode.TEST_GENERATION,
+            WorkflowMode.DOCUMENTATION,
+            WorkflowMode.BUG_FIX,
+        } and not (self.code_input and self.code_input.strip()):
+            raise ValueError(f"code_input is required for {self.mode.value} mode")
+
+        if self.mode == WorkflowMode.SECURITY_AUDIT:
+            has_code = bool(self.code_input and self.code_input.strip())
+            has_files = bool(
+                self.files_input
+                and any(content.strip() for content in self.files_input.values())
+            )
+            if not has_code and not has_files:
+                raise ValueError(
+                    "code_input or non-empty files_input is required for security_audit mode"
+                )
+        return self
+
+
+def serialize_orchestration_result(result: OrchestrationResult) -> dict[str, Any]:
+    """Convert an OrchestrationResult into a JSON-compatible dictionary.
+
+    Unsupported values raise TypeError instead of being replaced with a string
+    or silently omitted.
+    """
+    if not isinstance(result, OrchestrationResult):
+        raise TypeError("result must be an OrchestrationResult")
+
+    try:
+        encoded = jsonable_encoder(asdict(result))
+        # Round-trip through JSON to guarantee the returned structure contains
+        # only values accepted by a standard JSON encoder.
+        return json.loads(json.dumps(encoded, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise TypeError("OrchestrationResult contains a non-JSON-compatible value") from exc
 
 
 def serialize_workflow_result(result: Any) -> Any:

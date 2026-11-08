@@ -169,7 +169,11 @@ class AdvancedOrchestrator:
                 )
             elif status == AgentExecutionStatus.FAILED:
                 emit_step_event(
-                    "step_failed", {"step": name, "error": err or "Step failed"}
+                    "step_failed",
+                    {
+                        "step": name,
+                        "error": "Step failed. See the orchestration result for details.",
+                    },
                 )
 
         def input_summary_truncate(text: str, max_len: int = 120) -> str:
@@ -679,8 +683,13 @@ class AdvancedOrchestrator:
                 )
 
         except Exception as exc:
-            logger.exception("AdvancedOrchestrator failed: %s", exc)
             active_step = next(iter(active_steps.items()), None)
+            failed_step_name = active_step[1][0] if active_step is not None else "unknown"
+            logger.error(
+                "AdvancedOrchestrator failed during step %s (%s)",
+                failed_step_name,
+                type(exc).__name__,
+            )
             if active_step is not None:
                 t0, (name, input_summary, started_at) = active_step
                 duration_ms = (time.perf_counter() - t0) * 1000
@@ -701,7 +710,11 @@ class AdvancedOrchestrator:
                 if event_emitter and event_emission_error is None:
                     try:
                         emit_step_event(
-                            "step_failed", {"step": name, "error": str(exc)}
+                            "step_failed",
+                            {
+                                "step": name,
+                                "error": "Step failed. See the orchestration result for details.",
+                            },
                         )
                     except Exception as event_exc:
                         exc = RuntimeError(

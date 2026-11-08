@@ -15,7 +15,10 @@ from agents.coder_agent import CoderAgent
 from agents.code_reviewer_agent import ReviewerAgent
 from agents.debugger_agent import DebuggerAgent
 from agents.documentation_agent import DocumentationAgent
+from agents.rag_agent import RagAgent
 from agents.test_generator_agent import TestGeneratorAgent
+from agents.validator_agent import ValidatorAgent
+from backend.application.advanced_orchestrator import AdvancedOrchestrator
 from backend.application.use_cases import GenerateCodeUseCase
 from backend.application.debugging_use_cases import DebugCodeUseCase
 from backend.application.documentation_use_cases import GenerateDocumentationUseCase
@@ -151,6 +154,33 @@ def get_test_execution_use_case() -> ExecuteTestsUseCase:
     command is configured by the application, never accepted from the user.
     """
     return ExecuteTestsUseCase(executor=TestExecutor(timeout_seconds=30.0))
+
+
+@lru_cache(maxsize=1)
+def get_rag_agent() -> RagAgent:
+    """Provide a cached RAG agent using the repository pipeline retriever."""
+    return RagAgent(
+        llm_client=_get_llm_client(),
+        retriever=get_repository_rag_pipeline().retriever,
+        top_k=_build_rag_config().top_k,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_advanced_orchestrator() -> AdvancedOrchestrator:
+    """Provide the advanced orchestrator composed from shared dependencies."""
+    return AdvancedOrchestrator(
+        planner_use_case=get_generate_plan_use_case(),
+        coder_agent=get_coder_agent(),
+        reviewer_agent=get_reviewer_agent(),
+        debugger_agent=get_debugger_agent(),
+        test_generator_agent=get_test_generator_agent(),
+        test_executor=get_test_execution_use_case(),
+        validator_agent=ValidatorAgent(),
+        documentation_agent=get_documentation_agent(),
+        rag_agent=get_rag_agent(),
+        python_executor=get_execute_code_use_case(),
+    )
 
 
 @lru_cache(maxsize=1)

@@ -604,7 +604,16 @@ def test_feature_development_stops_after_validation_failure(mock_dependencies) -
     mock_dependencies["reviewer_agent"].review_code.assert_not_called()
 
 
-def test_feature_development_reports_execution_failure(mock_dependencies) -> None:
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "sentinel"),
+    [
+        ("SECRET_SOURCE_SENTINEL_123", "", "SECRET_SOURCE_SENTINEL_123"),
+        ("", "SECRET_STDERR_SENTINEL_456", "SECRET_STDERR_SENTINEL_456"),
+    ],
+)
+def test_feature_development_reports_execution_failure_without_leaking_output(
+    mock_dependencies, stdout: str, stderr: str, sentinel: str
+) -> None:
     from agents.planner_agent import ImplementationPlan
     from backend.application.planning_use_cases import GeneratePlanResult
 
@@ -627,18 +636,38 @@ def test_feature_development_reports_execution_failure(mock_dependencies) -> Non
         final_summary="One test",
     )
     mock_dependencies["test_executor"].execute.return_value = TestExecutionResponse(
-        success=False, stdout="1 failed", stderr="", execution_time_ms=2,
+        success=False, stdout=stdout, stderr=stderr, execution_time_ms=2,
         exit_code=1, passed=0, failed=1,
     )
     mock_dependencies["reviewer_agent"].review_code.return_value = MagicMock(
         overall_score=50, findings=[], recommendations=[], code_duplications=[]
     )
 
-    result = AdvancedOrchestrator(**mock_dependencies).execute("Build feature")
+    emitter = RecordingEventEmitter()
+    result = AdvancedOrchestrator(**mock_dependencies).execute(
+        "Build feature", event_emitter=emitter, job_id="job-safe-output"
+    )
 
     assert result.success is False
     assert result.output_data["test_execution"]["success"] is False
     assert "tests failed" in result.summary.casefold()
+    assert result.output_data["test_execution"]["stdout"] == stdout
+    assert result.output_data["test_execution"]["stderr"] == stderr
+
+    failed_event = next(
+        event for event in emitter.get_events() if event.event_type == "step_failed"
+    )
+    assert failed_event.payload == {
+        "step": "TestExecutor",
+        "error": "Step failed. See the orchestration result for details.",
+    }
+    from backend.api.routes import _format_sse_event
+
+    serialized_events = "".join(
+        _format_sse_event(event) for event in emitter.get_events()
+    )
+    assert sentinel not in serialized_events
+    assert "Step failed. See the orchestration result for details." in serialized_events
 
 
 def test_feature_development_records_reviewer_exception_with_partial_results(
@@ -831,7 +860,9 @@ def test_event_emitter_receives_ordered_workflow_events_for_success(
     assert events[1].payload["duration_ms"] >= 0
 
 
-def test_event_emitter_receives_failed_step_event_in_order(mock_dependencies) -> None:
+def test_event_emitter_receives_failed_step_event_in_order(
+    mock_dependencies, caplog
+) -> None:
     mock_dependencies["documentation_agent"].generate_documentation.side_effect = (
         RuntimeError("documentation unavailable")
     )
@@ -847,8 +878,11 @@ def test_event_emitter_receives_failed_step_event_in_order(mock_dependencies) ->
     assert [event.event_type for event in events] == ["step_start", "step_failed"]
     assert events[0].payload == {"step": "DocumentationAgent"}
     assert events[1].payload == {
-        "step": "DocumentationAgent", "error": "documentation unavailable",
+        "step": "DocumentationAgent",
+        "error": "Step failed. See the orchestration result for details.",
     }
+    assert result.error == "documentation unavailable"
+    assert "documentation unavailable" not in caplog.text
     assert all(event.job_id == "job-456" for event in events)
 
 
