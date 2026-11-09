@@ -248,8 +248,14 @@ def test_app_imports_successfully() -> None:
 def test_apptest_initial_render_without_exceptions() -> None:
     at = AppTest.from_file(APP_PATH).run()
     assert len(at.exception) == 0
-    # Verifies the 4 navigation tabs render
-    assert len(at.tabs) == 4
+    # Verifies all intended navigation tabs render in order
+    assert [tab.label for tab in at.tabs] == [
+        "Coding Workspace",
+        "Repository Changes & Approval",
+        "Repository RAG",
+        "Standalone Agent Tools",
+        "Advanced Orchestrator",
+    ]
     # Verifies prompt input area exists
     assert at.text_area(key="main_workflow_prompt_input") is not None
     # Verifies run buttons exist
@@ -265,6 +271,422 @@ def test_apptest_prompt_validation_empty() -> None:
     assert len(at.exception) == 0
     assert len(at.warning) > 0
     assert "Please enter a coding prompt" in at.warning[0].value
+
+
+def test_advanced_stream_url_encodes_job_id() -> None:
+    from frontend.app import _advanced_orchestration_stream_url
+
+    assert _advanced_orchestration_stream_url(
+        "http://backend/", "job /ü?"
+    ) == "http://backend/advanced-orchestration/jobs/job%20%2F%C3%BC%3F/stream"
+
+
+def test_advanced_sse_parser_handles_split_lines_multiple_events_and_line_endings() -> None:
+    from frontend.app import _iter_sse_lines_from_chunks
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        iter_advanced_orchestration_progress,
+    )
+
+    chunks = [
+        b'event: step_start\r\ndata: {"event_type":"step_start",\r\ndata: '
+        b'"payload":{"step":"Split',
+        b'Step"}}\r\n\r\nevent: step_complete\n'
+        b'data: {"event_type":"step_complete","payload":'
+        b'{"step":"SplitStep","duration_ms":4}}\n\n',
+    ]
+    lines = _iter_sse_lines_from_chunks(chunks, deadline=10, monotonic=lambda: 0)
+    progress = AdvancedProgressState(job_id="adv-123")
+
+    events = list(iter_advanced_orchestration_progress(lines, progress))
+
+    assert [message for _, message in events] == [
+        "SplitStep started",
+        "SplitStep completed (4.0 ms)",
+    ]
+    assert progress.steps["SplitStep"].status == "completed"
+
+
+def test_advanced_sse_parser_reconstructs_utf8_split_across_byte_chunks() -> None:
+    from frontend.app import _iter_sse_lines_from_chunks
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        iter_advanced_orchestration_progress,
+    )
+
+    event = (
+        'event: step_start\ndata: '
+        '{"event_type":"step_start","payload":{"step":"CaféAgent"}}\n\n'
+    ).encode("utf-8")
+    split_at = event.index(b"\xc3\xa9") + 1
+    chunks = [event[:split_at], event[split_at:]]
+    progress = AdvancedProgressState(job_id="adv-123")
+
+    parsed = list(
+        iter_advanced_orchestration_progress(
+            _iter_sse_lines_from_chunks(chunks, deadline=10, monotonic=lambda: 0),
+            progress,
+        )
+    )
+
+    assert [message for _, message in parsed] == ["CaféAgent started"]
+    assert progress.steps["CaféAgent"].status == "running"
+
+
+def test_advanced_sse_parser_handles_crlf_delimiters_split_across_chunks() -> None:
+    from frontend.app import _iter_sse_lines_from_chunks
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        iter_advanced_orchestration_progress,
+    )
+
+    chunks = [
+        b"event: step_start\r",
+        b'\ndata: {"event_type":"step_start","payload":{"step":"CrLfStep"}}\r',
+        b"\r",
+        b"\n",
+    ]
+    progress = AdvancedProgressState(job_id="adv-123")
+
+    parsed = list(
+        iter_advanced_orchestration_progress(
+            _iter_sse_lines_from_chunks(chunks, deadline=10, monotonic=lambda: 0),
+            progress,
+        )
+    )
+
+    assert [message for _, message in parsed] == ["CrLfStep started"]
+    assert progress.steps["CrLfStep"].status == "running"
+
+
+def test_advanced_sse_parser_flushes_final_event_without_inventing_one() -> None:
+    from frontend.app import _iter_sse_lines_from_chunks
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        iter_advanced_orchestration_progress,
+    )
+
+    final_event = (
+        b'event: job_completed\ndata: '
+        b'{"event_type":"job_completed","job_id":"adv-123","payload":{}}'
+    )
+    progress = AdvancedProgressState(job_id="adv-123")
+    parsed = list(
+        iter_advanced_orchestration_progress(
+            _iter_sse_lines_from_chunks(
+                [final_event], deadline=10, monotonic=lambda: 0
+            ),
+            progress,
+        )
+    )
+
+    assert [message for _, message in parsed] == [
+        "Advanced orchestration job completed"
+    ]
+    assert progress.is_terminal is True
+
+
+class _FakeAdvancedStreamResponse:
+    def __init__(self, chunks) -> None:
+        self.status_code = 200
+        self.chunks = chunks
+        self.chunks_consumed = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.closed = True
+
+    def iter_content(self, *, chunk_size):
+        self.chunk_size = chunk_size
+        for chunk in self.chunks:
+            self.chunks_consumed.append(chunk)
+            yield chunk
+
+
+def test_advanced_terminal_event_closes_response_and_stops_consuming() -> None:
+    import time
+
+    from frontend.app import _consume_advanced_stream_with_fallback
+    from frontend.advanced_orchestration_ui import AdvancedProgressState
+
+    terminal = (
+        b'event: job_completed\ndata: '
+        b'{"event_type":"job_completed","job_id":"adv-123","payload":{}}\n\n'
+    )
+    response = _FakeAdvancedStreamResponse([terminal, b"unused chunk"])
+    progress = AdvancedProgressState(job_id="adv-123")
+    events = []
+    fallback = MagicMock()
+
+    _consume_advanced_stream_with_fallback(
+        lambda: response,
+        progress,
+        time.monotonic() + 5,
+        lambda event, message: events.append(message),
+        MagicMock(),
+        fallback,
+        job_id="adv-123",
+    )
+
+    assert events == ["Advanced orchestration job completed"]
+    assert response.closed is True
+    assert response.chunks_consumed == [terminal]
+    assert response.chunk_size == 1
+    fallback.assert_called_once_with(True)
+
+
+def test_advanced_deadline_closes_response_and_runs_bounded_poll_fallback() -> None:
+    from frontend.app import _consume_advanced_stream_with_fallback
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        poll_advanced_orchestration_job,
+    )
+
+    class DeadlineClock:
+        calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return 0 if self.calls <= 2 else 2
+
+    response = _FakeAdvancedStreamResponse([b": keepalive\n\n"])
+    progress = AdvancedProgressState(job_id="adv-123")
+    warnings = []
+    poll_results = []
+    running = {"job_id": "adv-123", "status": "running"}
+
+    def bounded_fallback(terminal: bool) -> None:
+        assert terminal is False
+        poll_results.append(
+            poll_advanced_orchestration_job(
+                "http://backend",
+                "adv-123",
+                max_attempts=2,
+                sleep=MagicMock(),
+            )
+        )
+
+    with patch(
+        "frontend.advanced_orchestration_ui.requests.request",
+        return_value=MagicMock(status_code=200, json=MagicMock(return_value=running)),
+    ) as status_request:
+        _consume_advanced_stream_with_fallback(
+            lambda: response,
+            progress,
+            deadline=1,
+            on_event=MagicMock(),
+            on_warning=warnings.append,
+            status_fallback=bounded_fallback,
+            job_id="adv-123",
+            monotonic=DeadlineClock(),
+        )
+
+    assert response.closed is True
+    assert warnings == [
+        "The progress stream reached its time limit. Checking job status instead."
+    ]
+    assert len(poll_results) == 1
+    assert poll_results[0]["status"] == "running"
+    assert status_request.call_count == 2
+
+
+@pytest.mark.parametrize("event_type", ["job_completed", "job_failed"])
+def test_terminal_event_for_another_job_runs_bounded_status_poll_fallback(event_type) -> None:
+    import time
+
+    from frontend.app import _consume_advanced_stream_with_fallback
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        poll_advanced_orchestration_job,
+    )
+
+    foreign_job_terminal = (
+        f'event: {event_type}\ndata: '
+        f'{{"event_type":"{event_type}","job_id":"adv-other","payload":{{}}}}\n\n'
+    ).encode("utf-8")
+    response = _FakeAdvancedStreamResponse([foreign_job_terminal])
+    progress = AdvancedProgressState(job_id="adv-123")
+    fallback_results = []
+    running = {"job_id": "adv-123", "status": "running"}
+
+    def bounded_fallback(terminal: bool) -> None:
+        assert terminal is False
+        fallback_results.append(
+            poll_advanced_orchestration_job(
+                "http://backend",
+                "adv-123",
+                max_attempts=2,
+                sleep=MagicMock(),
+            )
+        )
+
+    with patch(
+        "frontend.advanced_orchestration_ui.requests.request",
+        return_value=MagicMock(status_code=200, json=MagicMock(return_value=running)),
+    ) as status_request:
+        _consume_advanced_stream_with_fallback(
+            lambda: response,
+            progress,
+            time.monotonic() + 5,
+            MagicMock(),
+            MagicMock(),
+            bounded_fallback,
+            job_id="adv-123",
+        )
+
+    assert response.closed is True
+    assert progress.is_terminal is False
+    assert len(fallback_results) == 1
+    assert fallback_results[0]["status"] == "running"
+    assert status_request.call_count == 2
+
+
+def test_stream_request_exception_closes_response_and_runs_bounded_poll_fallback() -> None:
+    import time
+
+    import requests
+
+    from frontend.app import _consume_advanced_stream_with_fallback
+    from frontend.advanced_orchestration_ui import (
+        AdvancedProgressState,
+        poll_advanced_orchestration_job,
+    )
+
+    class RequestFailingResponse(_FakeAdvancedStreamResponse):
+        def iter_content(self, *, chunk_size):
+            self.chunk_size = chunk_size
+            raise requests.RequestException("private transport detail")
+            yield b""  # Keep this method a generator for iter_content semantics.
+
+    response = RequestFailingResponse([])
+    progress = AdvancedProgressState(job_id="adv-123")
+    warnings = []
+    fallback_results = []
+    running = {"job_id": "adv-123", "status": "running"}
+
+    def bounded_fallback(terminal: bool) -> None:
+        assert terminal is False
+        fallback_results.append(
+            poll_advanced_orchestration_job(
+                "http://backend",
+                "adv-123",
+                max_attempts=2,
+                sleep=MagicMock(),
+            )
+        )
+
+    with patch(
+        "frontend.advanced_orchestration_ui.requests.request",
+        return_value=MagicMock(status_code=200, json=MagicMock(return_value=running)),
+    ) as status_request:
+        _consume_advanced_stream_with_fallback(
+            lambda: response,
+            progress,
+            time.monotonic() + 5,
+            MagicMock(),
+            warnings.append,
+            bounded_fallback,
+            job_id="adv-123",
+        )
+
+    assert response.closed is True
+    assert warnings == ["The event stream was interrupted. Checking job status…"]
+    assert "private transport detail" not in warnings[0]
+    assert progress.is_terminal is False
+    assert len(fallback_results) == 1
+    assert fallback_results[0]["status"] == "running"
+    assert status_request.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_warning"),
+    [([], None), ([object()], "unexpected error")],
+)
+def test_advanced_stream_exhaustion_and_parser_error_close_response(
+    chunks, expected_warning
+) -> None:
+    import time
+
+    from frontend.app import _consume_advanced_stream_with_fallback
+    from frontend.advanced_orchestration_ui import AdvancedProgressState
+
+    response = _FakeAdvancedStreamResponse(chunks)
+    warnings = []
+    fallback = MagicMock()
+    _consume_advanced_stream_with_fallback(
+        lambda: response,
+        AdvancedProgressState(job_id="adv-123"),
+        time.monotonic() + 5,
+        MagicMock(),
+        warnings.append,
+        fallback,
+        job_id="adv-123",
+        monotonic=lambda: 0,
+    )
+
+    assert response.closed is True
+    fallback.assert_called_once_with(False)
+    if expected_warning is None:
+        assert warnings == []
+    else:
+        assert expected_warning in warnings[0]
+
+
+def test_advanced_sse_parser_exception_closes_response_and_runs_fallback(monkeypatch) -> None:
+    import time
+
+    import frontend.app as app
+    from frontend.advanced_orchestration_ui import AdvancedProgressState
+
+    response = _FakeAdvancedStreamResponse([b"event: step_start\n\n"])
+    warnings = []
+    fallback = MagicMock()
+
+    def fail_parsing(lines, progress):
+        raise ValueError("parser failure")
+        yield  # Make this a generator, as the production parser is.
+
+    monkeypatch.setattr(app, "iter_advanced_orchestration_progress", fail_parsing)
+    app._consume_advanced_stream_with_fallback(
+        lambda: response,
+        AdvancedProgressState(job_id="adv-123"),
+        time.monotonic() + 5,
+        MagicMock(),
+        warnings.append,
+        fallback,
+        job_id="adv-123",
+        monotonic=lambda: 0,
+    )
+
+    assert response.closed is True
+    assert warnings == [
+        "The progress stream encountered an unexpected error. "
+        "Checking job status instead."
+    ]
+    fallback.assert_called_once_with(False)
+
+
+def test_advanced_stream_tracking_has_no_background_reader() -> None:
+    import inspect
+
+    import frontend.app as app
+
+    source = inspect.getsource(app)
+    assert "threading.Thread" not in source
+    assert "queue.Queue" not in source
+
+
+def test_advanced_research_answer_uses_existing_display_sanitizer(monkeypatch) -> None:
+    import frontend.app as app
+
+    rendered = MagicMock()
+    monkeypatch.setattr(app.st, "text", rendered)
+    app._render_advanced_research_answer('api_key="SECRET_VALUE"')
+
+    rendered.assert_called_once_with("api_key=[REDACTED]")
 
 
 # 16. AppTest example prompt preset selection

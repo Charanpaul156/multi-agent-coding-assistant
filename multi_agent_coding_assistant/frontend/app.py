@@ -5,15 +5,28 @@ AI-powered repository-aware coding workspace and dashboard.
 
 from __future__ import annotations
 
+import codecs
 import logging
+import math
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import quote
 
 import requests
 import streamlit as st
 
+from frontend.advanced_orchestration_ui import (
+    AdvancedOrchestrationApiError,
+    AdvancedProgressState,
+    build_advanced_orchestration_payload,
+    format_advanced_progress_event,
+    get_advanced_orchestration_job_status,
+    iter_advanced_orchestration_progress,
+    poll_advanced_orchestration_job,
+    submit_advanced_orchestration_job,
+)
 from frontend.workflow_ui import (
     WorkflowProgressState,
     check_backend_health,
@@ -33,6 +46,164 @@ from frontend.workflow_ui import (
 logger = logging.getLogger(__name__)
 
 BACKEND_URL = "http://localhost:8000"
+ADVANCED_SSE_TRACKING_DEADLINE_SECONDS = 120.0
+
+
+class _AdvancedSSEDeadlineExceeded(TimeoutError):
+    """Raised when advanced orchestration streaming reaches its wall deadline."""
+
+
+def _advanced_orchestration_stream_url(base_url: str, job_id: str) -> str:
+    """Build the SSE URL using the same path-segment encoding as status requests."""
+    return (
+        f"{base_url.rstrip('/')}/advanced-orchestration/jobs/"
+        f"{quote(job_id.strip(), safe='')}/stream"
+    )
+
+
+def _iter_advanced_progress_before_deadline(
+    lines: Any,
+    progress: AdvancedProgressState,
+    deadline: float,
+    *,
+    monotonic: Any = time.monotonic,
+) -> Any:
+    """Yield progress while enforcing an absolute wall-clock deadline."""
+    events = iter_advanced_orchestration_progress(lines, progress)
+    while True:
+        if monotonic() >= deadline:
+            raise _AdvancedSSEDeadlineExceeded(
+                "Advanced orchestration progress stream reached its deadline."
+            )
+        try:
+            event = next(events)
+        except StopIteration:
+            return
+        if monotonic() >= deadline:
+            raise _AdvancedSSEDeadlineExceeded(
+                "Advanced orchestration progress stream reached its deadline."
+            )
+        yield event
+
+
+def _iter_sse_lines_from_chunks(
+    chunks: Any,
+    deadline: float,
+    *,
+    monotonic: Any = time.monotonic,
+) -> Any:
+    """Decode chunks into SSE lines, retaining partial lines and checking the deadline.
+
+    A blocking socket read can overrun the overall deadline by up to the configured
+    requests read timeout. Checks run between chunks and while buffered lines are parsed.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    buffer = ""
+
+    def _check_deadline() -> None:
+        if monotonic() >= deadline:
+            raise _AdvancedSSEDeadlineExceeded(
+                "Advanced orchestration progress stream reached its deadline."
+            )
+
+    def _complete_lines(*, final: bool = False) -> Any:
+        nonlocal buffer
+        while True:
+            _check_deadline()
+            lf = buffer.find("\n")
+            cr = buffer.find("\r")
+            positions = [position for position in (lf, cr) if position >= 0]
+            if not positions:
+                return
+            separator = min(positions)
+            if buffer[separator] == "\r" and separator + 1 == len(buffer) and not final:
+                return
+            line = buffer[:separator]
+            separator_width = (
+                2
+                if buffer[separator] == "\r"
+                and separator + 1 < len(buffer)
+                and buffer[separator + 1] == "\n"
+                else 1
+            )
+            buffer = buffer[separator + separator_width :]
+            yield line
+
+    for chunk in chunks:
+        _check_deadline()
+        if isinstance(chunk, bytes):
+            buffer += decoder.decode(chunk, final=False)
+        elif isinstance(chunk, str):
+            buffer += chunk
+        else:
+            raise TypeError("SSE response chunks must be bytes or text")
+        yield from _complete_lines()
+        _check_deadline()
+
+    buffer += decoder.decode(b"", final=True)
+    yield from _complete_lines(final=True)
+    if buffer:
+        _check_deadline()
+        yield buffer
+
+
+def _consume_advanced_stream_with_fallback(
+    response_factory: Callable[[], Any],
+    progress: AdvancedProgressState,
+    deadline: float,
+    on_event: Callable[[Any, str], None],
+    on_warning: Callable[[str], None],
+    status_fallback: Callable[[bool], None],
+    *,
+    job_id: str,
+    monotonic: Any = time.monotonic,
+) -> None:
+    """Consume an SSE response synchronously, close it, then run finite status fallback."""
+    try:
+        with response_factory() as response:
+            if response.status_code != 200:
+                raise AdvancedOrchestrationApiError(
+                    f"Event stream connection failed (HTTP {response.status_code}).",
+                    status_code=response.status_code,
+                )
+            lines = _iter_sse_lines_from_chunks(
+                response.iter_content(chunk_size=1),
+                deadline,
+                monotonic=monotonic,
+            )
+            for event, message in _iter_advanced_progress_before_deadline(
+                lines, progress, deadline, monotonic=monotonic
+            ):
+                on_event(event, message)
+                if progress.is_terminal:
+                    break
+    except requests.RequestException:
+        on_warning("The event stream was interrupted. Checking job status…")
+    except _AdvancedSSEDeadlineExceeded:
+        on_warning(
+            "The progress stream reached its time limit. Checking job status instead."
+        )
+    except AdvancedOrchestrationApiError as exc:
+        on_warning(str(exc))
+    except Exception as exc:
+        logger.error(
+            "Advanced orchestration stream processing failed "
+            "(job_id=%s, exception_type=%s)",
+            job_id,
+            type(exc).__name__,
+        )
+        on_warning(
+            "The progress stream encountered an unexpected error. "
+            "Checking job status instead."
+        )
+
+    # The response context has exited before polling, including on terminal events.
+    status_fallback(progress.is_terminal)
+
+
+def _render_advanced_research_answer(answer: str) -> None:
+    """Render a research answer after applying the existing display sanitizer."""
+    st.text(sanitize_display_text(answer))
 
 st.set_page_config(
     page_title="Multi-Agent Coding Assistant",
@@ -420,6 +591,24 @@ if "modify_repository_result" not in st.session_state:
 if "modify_repository_proposal" not in st.session_state:
     st.session_state.modify_repository_proposal = None
 
+# Advanced Orchestrator state is deliberately isolated from Coding Workspace.
+if "advanced_orchestrator_job_id" not in st.session_state:
+    st.session_state.advanced_orchestrator_job_id = None
+if "advanced_orchestrator_status" not in st.session_state:
+    st.session_state.advanced_orchestrator_status = None
+if "advanced_orchestrator_progress" not in st.session_state:
+    st.session_state.advanced_orchestrator_progress = AdvancedProgressState()
+if "advanced_orchestrator_result" not in st.session_state:
+    st.session_state.advanced_orchestrator_result = None
+if "advanced_orchestrator_error" not in st.session_state:
+    st.session_state.advanced_orchestrator_error = None
+if "advanced_orchestrator_stream_warning" not in st.session_state:
+    st.session_state.advanced_orchestrator_stream_warning = None
+if "advanced_orchestrator_events" not in st.session_state:
+    st.session_state.advanced_orchestrator_events = []
+if "advanced_orchestrator_submission_active" not in st.session_state:
+    st.session_state.advanced_orchestrator_submission_active = False
+
 
 # Quick backend connectivity check (cached or light)
 def _get_backend_status() -> dict[str, Any]:
@@ -461,11 +650,12 @@ with st.sidebar:
 # Top Application Navigation Tabs
 # ===========================================================================
 
-tab_workspace, tab_repo_ops, tab_rag, tab_standalone = st.tabs([
+tab_workspace, tab_repo_ops, tab_rag, tab_standalone, tab_advanced_orchestrator = st.tabs([
     "Coding Workspace",
     "Repository Changes & Approval",
     "Repository RAG",
     "Standalone Agent Tools",
+    "Advanced Orchestrator",
 ])
 
 
@@ -1512,3 +1702,414 @@ with tab_standalone:
                     st.session_state.tests_report.get("generated_test_code", "")
                 )
                 st.code(t_code, language="python")
+
+
+# ===========================================================================
+# TAB 5: Advanced Orchestrator
+# ===========================================================================
+with tab_advanced_orchestrator:
+    st.subheader("Advanced Orchestrator")
+    st.write(
+        "Submit a focused codebase question, security audit, documentation, or "
+        "bug-fix proposal. Results are proposals only; this tab does not write "
+        "to your repository or execute generated code."
+    )
+
+    advanced_mode_labels = {
+        "codebase_chat": "Codebase chat",
+        "security_audit": "Security audit",
+        "documentation": "Documentation",
+        "bug_fix": "Bug-fix proposal",
+    }
+    advanced_mode = st.selectbox(
+        "Orchestration mode",
+        options=list(advanced_mode_labels),
+        format_func=lambda mode: advanced_mode_labels[mode],
+        key="advanced_orchestrator_mode_input",
+    )
+    advanced_prompt = st.text_area(
+        "Request",
+        height=100,
+        placeholder="Describe what you want the agents to analyze or propose.",
+        key="advanced_orchestrator_prompt_input",
+    )
+
+    advanced_code_input = None
+    if advanced_mode in {"security_audit", "documentation", "bug_fix"}:
+        code_label = (
+            "Code to audit (optional when providing file content)"
+            if advanced_mode == "security_audit"
+            else "Code input"
+        )
+        advanced_code_input = st.text_area(
+            code_label,
+            height=220,
+            key="advanced_orchestrator_code_input",
+            help=(
+                "Required for documentation and bug-fix modes. Security audit "
+                "requires code or non-empty file content."
+            ),
+        )
+
+    advanced_files_input = None
+    if advanced_mode == "security_audit":
+        advanced_file_name = st.text_input(
+            "Optional file name",
+            value="source.py",
+            key="advanced_orchestrator_file_name_input",
+        )
+        advanced_file_content = st.text_area(
+            "Optional file content",
+            height=180,
+            key="advanced_orchestrator_file_content_input",
+        )
+        if advanced_file_content.strip():
+            advanced_files_input = {advanced_file_name: advanced_file_content}
+
+    submit_advanced = st.button(
+        "Submit Advanced Job",
+        type="primary",
+        key="advanced_orchestrator_submit",
+        disabled=st.session_state.advanced_orchestrator_submission_active,
+    )
+
+    def _render_advanced_progress() -> None:
+        progress = st.session_state.advanced_orchestrator_progress
+        status = st.session_state.advanced_orchestrator_status or progress.status
+        metric_status, metric_step = st.columns(2)
+        metric_status.metric("Job status", str(status).replace("_", " ").title())
+        metric_step.metric("Current step", progress.current_step or "Waiting for events")
+
+        completed_steps = [
+            name for name, step in progress.steps.items() if step.status == "completed"
+        ]
+        failed_steps = [
+            name for name, step in progress.steps.items() if step.status == "failed"
+        ]
+        if completed_steps:
+            st.caption("Completed steps: " + ", ".join(completed_steps))
+        if failed_steps:
+            st.warning("Failed steps: " + ", ".join(failed_steps))
+        for name, step in progress.steps.items():
+            if step.duration_ms is not None:
+                st.caption(f"{name}: {step.duration_ms:.1f} ms")
+
+    def _track_advanced_job(
+        job_id: str,
+        *,
+        stream_deadline_seconds: float = ADVANCED_SSE_TRACKING_DEADLINE_SECONDS,
+    ) -> None:
+        if (
+            isinstance(stream_deadline_seconds, bool)
+            or not isinstance(stream_deadline_seconds, (int, float))
+            or not math.isfinite(stream_deadline_seconds)
+            or stream_deadline_seconds <= 0
+        ):
+            raise ValueError("stream_deadline_seconds must be a finite positive number")
+        progress = st.session_state.advanced_orchestrator_progress
+        st.session_state.advanced_orchestrator_error = None
+        st.session_state.advanced_orchestrator_stream_warning = None
+        progress_view = st.empty()
+        progress_view.info(f"Connecting to the event stream for job `{job_id}`…")
+        stream_url = _advanced_orchestration_stream_url(BACKEND_URL, job_id)
+        stream_deadline = time.monotonic() + stream_deadline_seconds
+
+        def _update_advanced_status(status_data: dict[str, Any]) -> None:
+            status = status_data.get("status")
+            st.session_state.advanced_orchestrator_status = status
+            progress.status = status or progress.status
+            progress.is_terminal = status in {"completed", "failed", "cancelled"}
+            job_error = status_data.get("error")
+            st.session_state.advanced_orchestrator_error = (
+                job_error if isinstance(job_error, str) and job_error else None
+            )
+            job_result = status_data.get("result")
+            st.session_state.advanced_orchestrator_result = (
+                job_result if isinstance(job_result, dict) else None
+            )
+
+        def _on_advanced_event(event: Any, message: str) -> None:
+            st.session_state.advanced_orchestrator_status = progress.status
+            st.session_state.advanced_orchestrator_events.append(
+                format_advanced_progress_event(event)
+            )
+            st.session_state.advanced_orchestrator_events = (
+                st.session_state.advanced_orchestrator_events[-100:]
+            )
+            progress_view.empty()
+            _render_advanced_progress()
+            st.caption(message)
+
+        def _show_stream_warning(message: str) -> None:
+            if "time limit" in message or "unexpected error" in message:
+                st.session_state.advanced_orchestrator_stream_warning = message
+            progress_view.warning(message)
+
+        def _status_fallback(terminal_event_seen: bool) -> None:
+            if terminal_event_seen:
+                final_status = get_advanced_orchestration_job_status(
+                    BACKEND_URL, job_id, timeout=10
+                )
+            else:
+                final_status = poll_advanced_orchestration_job(
+                    BACKEND_URL,
+                    job_id,
+                    max_attempts=4,
+                    poll_interval_seconds=1.5,
+                    timeout=10,
+                    on_status=_update_advanced_status,
+                )
+            _update_advanced_status(final_status)
+
+        try:
+            # A blocked socket read can exceed the overall deadline by at most
+            # this configured 20-second read timeout before control returns.
+            _consume_advanced_stream_with_fallback(
+                lambda: requests.get(
+                    stream_url,
+                    stream=True,
+                    timeout=(5, 20),
+                ),
+                progress,
+                stream_deadline,
+                _on_advanced_event,
+                _show_stream_warning,
+                _status_fallback,
+                job_id=job_id,
+            )
+        except AdvancedOrchestrationApiError as exc:
+            st.session_state.advanced_orchestrator_error = str(exc)
+        except Exception as exc:
+            logger.error(
+                "Advanced orchestration status retrieval failed "
+                "(job_id=%s, exception_type=%s)",
+                job_id,
+                type(exc).__name__,
+            )
+            st.session_state.advanced_orchestrator_error = (
+                "Unable to retrieve the advanced orchestration job status."
+            )
+
+        progress_view.empty()
+        _render_advanced_progress()
+
+    if submit_advanced and not st.session_state.advanced_orchestrator_submission_active:
+        st.session_state.advanced_orchestrator_submission_active = True
+        try:
+            try:
+                advanced_payload = build_advanced_orchestration_payload(
+                    advanced_mode,
+                    advanced_prompt,
+                    code_input=advanced_code_input,
+                    files_input=advanced_files_input,
+                )
+                # Clear only advanced-job state before a new submission.
+                st.session_state.advanced_orchestrator_job_id = None
+                st.session_state.advanced_orchestrator_status = None
+                st.session_state.advanced_orchestrator_result = None
+                st.session_state.advanced_orchestrator_error = None
+                st.session_state.advanced_orchestrator_stream_warning = None
+                st.session_state.advanced_orchestrator_events = []
+                st.session_state.advanced_orchestrator_progress = AdvancedProgressState()
+                job_ref = submit_advanced_orchestration_job(
+                    BACKEND_URL, advanced_payload
+                )
+                st.session_state.advanced_orchestrator_job_id = job_ref["job_id"]
+                st.session_state.advanced_orchestrator_status = job_ref["status"]
+                st.session_state.advanced_orchestrator_progress = AdvancedProgressState(
+                    job_id=job_ref["job_id"], status=job_ref["status"]
+                )
+                _track_advanced_job(job_ref["job_id"])
+            except (ValueError, AdvancedOrchestrationApiError) as exc:
+                st.session_state.advanced_orchestrator_error = str(exc)
+            except Exception as exc:
+                logger.error(
+                    "Advanced orchestration submission processing failed "
+                    "(exception_type=%s)",
+                    type(exc).__name__,
+                )
+                st.session_state.advanced_orchestrator_error = (
+                    "Unable to submit or track the advanced orchestration job."
+                )
+        finally:
+            st.session_state.advanced_orchestrator_submission_active = False
+
+    current_advanced_job_id = st.session_state.advanced_orchestrator_job_id
+    if current_advanced_job_id:
+        st.markdown("---")
+        st.caption(f"Advanced job ID: `{current_advanced_job_id}`")
+        action_track, action_status = st.columns(2)
+        with action_track:
+            if st.button(
+                "Reconnect to progress stream",
+                key="advanced_orchestrator_reconnect",
+            ):
+                try:
+                    _track_advanced_job(current_advanced_job_id)
+                except Exception as exc:
+                    logger.error(
+                        "Advanced orchestration reconnect processing failed "
+                        "(job_id=%s, exception_type=%s)",
+                        current_advanced_job_id,
+                        type(exc).__name__,
+                    )
+                    st.session_state.advanced_orchestrator_stream_warning = (
+                        "Unable to reconnect to advanced orchestration progress. "
+                        "Refresh job status to continue tracking."
+                    )
+        with action_status:
+            if st.button(
+                "Refresh job status",
+                key="advanced_orchestrator_refresh_status",
+            ):
+                try:
+                    refreshed = get_advanced_orchestration_job_status(
+                        BACKEND_URL, current_advanced_job_id
+                    )
+                    st.session_state.advanced_orchestrator_status = refreshed["status"]
+                    st.session_state.advanced_orchestrator_progress.status = refreshed[
+                        "status"
+                    ]
+                    st.session_state.advanced_orchestrator_progress.is_terminal = (
+                        refreshed["status"] in {"completed", "failed", "cancelled"}
+                    )
+                    st.session_state.advanced_orchestrator_result = refreshed.get("result")
+                    refreshed_error = refreshed.get("error")
+                    st.session_state.advanced_orchestrator_error = (
+                        refreshed_error if isinstance(refreshed_error, str) else None
+                    )
+                except AdvancedOrchestrationApiError as exc:
+                    st.session_state.advanced_orchestrator_error = str(exc)
+
+        _render_advanced_progress()
+        if st.session_state.advanced_orchestrator_events:
+            with st.expander("Advanced orchestration progress events"):
+                for event_message in st.session_state.advanced_orchestrator_events:
+                    st.write(event_message)
+
+    if st.session_state.advanced_orchestrator_error:
+        st.error(sanitize_error_message(st.session_state.advanced_orchestrator_error))
+    if st.session_state.advanced_orchestrator_stream_warning:
+        st.warning(st.session_state.advanced_orchestrator_stream_warning)
+
+    advanced_result = st.session_state.advanced_orchestrator_result
+    advanced_status = st.session_state.advanced_orchestrator_status
+    if current_advanced_job_id and advanced_status in {"failed", "cancelled"}:
+        st.warning("The advanced orchestration job did not complete successfully.")
+
+    if current_advanced_job_id and advanced_status in {"completed", "failed", "cancelled"}:
+        st.markdown("### Final orchestration result")
+        st.write(
+            f"**Job lifecycle:** {str(advanced_status).replace('_', ' ').title()}"
+        )
+        if isinstance(advanced_result, dict):
+            if isinstance(advanced_result.get("success"), bool):
+                st.write(
+                    "**Orchestration outcome:** "
+                    + ("Successful" if advanced_result["success"] else "Unsuccessful")
+                )
+            summary = advanced_result.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                st.markdown("#### Summary")
+                st.text(sanitize_display_text(summary))
+
+            records = advanced_result.get("agent_records") or []
+            if isinstance(records, list) and records:
+                st.markdown("#### Agent steps")
+                st.dataframe(
+                    [
+                        {
+                            "Agent": record.get("agent_name", "Unknown"),
+                            "Status": record.get("status", "unknown"),
+                            "Duration (ms)": record.get("duration_ms"),
+                        }
+                        for record in records
+                        if isinstance(record, dict)
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            output_data = advanced_result.get("output_data") or {}
+            if isinstance(output_data, dict):
+                research = output_data.get("research")
+                if isinstance(research, dict):
+                    st.markdown("#### Research output")
+                    answer = research.get("answer")
+                    if isinstance(answer, str) and answer:
+                        _render_advanced_research_answer(answer)
+                    elif research.get("answer_status") == "insufficient_evidence":
+                        st.info("The orchestrator could not verify a supported answer.")
+                    for source in research.get("sources", []) or []:
+                        if isinstance(source, dict):
+                            st.caption(
+                                f"{source.get('file_path', 'Source')} "
+                                f"(lines {source.get('start_line', '?')}–"
+                                f"{source.get('end_line', '?')})"
+                            )
+
+                validation = output_data.get("validation")
+                if isinstance(validation, dict):
+                    st.markdown("#### Validation")
+                    st.write(
+                        f"Errors: {validation.get('error_count', 0)} · "
+                        f"Warnings: {validation.get('warning_count', 0)}"
+                    )
+                    issues = validation.get("issues", []) or []
+                    if issues:
+                        st.dataframe(
+                            [
+                                {
+                                    "Rule": item.get("rule_id", ""),
+                                    "Category": item.get("category", ""),
+                                    "Severity": item.get("severity", ""),
+                                    "Line": item.get("line"),
+                                }
+                                for item in issues
+                                if isinstance(item, dict)
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                review = output_data.get("review")
+                if isinstance(review, dict):
+                    st.markdown("#### Review findings")
+                    if review.get("overall_score") is not None:
+                        st.metric("Review score", review["overall_score"])
+                    concerns = review.get("security_concerns") or []
+                    for concern in concerns:
+                        if isinstance(concern, str):
+                            st.write(sanitize_display_text(concern))
+
+                documentation = output_data.get("documentation")
+                if isinstance(documentation, dict):
+                    st.markdown("#### Proposed documentation")
+                    doc_summary = documentation.get("summary")
+                    if isinstance(doc_summary, str) and doc_summary:
+                        st.text(sanitize_display_text(doc_summary))
+                    markdown_doc = documentation.get("markdown_documentation")
+                    if isinstance(markdown_doc, str) and markdown_doc:
+                        st.code(markdown_doc, language="markdown")
+
+                debug = output_data.get("debug")
+                if isinstance(debug, dict):
+                    st.markdown("#### Bug-fix proposal")
+                    root_cause = debug.get("root_cause")
+                    if isinstance(root_cause, str) and root_cause:
+                        st.text(sanitize_display_text(root_cause))
+                    corrected_code = debug.get("corrected_code")
+                    if isinstance(corrected_code, str) and corrected_code:
+                        st.caption("Proposed corrected code (not applied)")
+                        st.code(corrected_code, language="python")
+                    targeted_diff = debug.get("targeted_diff")
+                    if isinstance(targeted_diff, str) and targeted_diff:
+                        st.caption("Proposed diff (not applied)")
+                        st.code(targeted_diff, language="diff")
+
+            if advanced_result.get("error"):
+                st.error(sanitize_error_message(str(advanced_result["error"])))
+        elif advanced_status == "completed":
+            st.info("The job completed without a result payload.")
+        else:
+            st.info("No orchestration result is available for this job.")
