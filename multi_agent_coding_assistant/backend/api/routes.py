@@ -15,7 +15,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api.deps import (
     get_debug_code_use_case,
@@ -28,6 +28,7 @@ from backend.api.deps import (
     get_generate_plan_use_case,
     get_generate_tests_use_case,
     get_index_repository_use_case,
+    get_git_workspace_use_cases,
     get_job_manager,
     get_job_runner,
     get_modify_repository_use_case,
@@ -93,11 +94,92 @@ from backend.application.modify_repository_use_cases import (
     ModifyRepositoryResult,
     ModifyRepositoryUseCase,
 )
+from backend.application.git_workspace_use_cases import GitWorkspaceUseCases
+from backend.infrastructure.git_service import GitServiceError
 from rag.context import format_retrieved_context
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+class GitWorkspacePathPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repository_path: str = Field(..., min_length=1, max_length=2048)
+
+
+class GitWorkspaceDiffPayload(GitWorkspacePathPayload):
+    staged: bool = False
+    max_bytes: int = Field(default=524288, ge=1, le=1048576)
+
+
+class GitWorkspaceHistoryPayload(GitWorkspacePathPayload):
+    max_count: int = Field(default=10, ge=1, le=100)
+
+
+class GitWorkspaceStatusEntryModel(BaseModel):
+    path: str
+    index_status: str
+    worktree_status: str
+    kind: str
+    original_path: str | None = None
+
+
+class GitWorkspaceStatusResponse(BaseModel):
+    branch: str
+    is_clean: bool
+    entries: list[GitWorkspaceStatusEntryModel]
+
+
+class GitWorkspaceBranchResponse(BaseModel):
+    branch: str
+
+
+class GitWorkspaceDiffResponse(BaseModel):
+    diff: str
+
+
+class GitWorkspaceCommitModel(BaseModel):
+    hash: str
+    author: str
+    date: str
+    message: str
+
+
+class GitWorkspaceHistoryResponse(BaseModel):
+    commits: list[GitWorkspaceCommitModel]
+
+
+def _git_workspace_http_error(exc: GitServiceError) -> HTTPException:
+    """Map internal classified errors to generic responses without paths/output."""
+    logger.info("Git workspace inspection rejected or failed (code=%s)", exc.code)
+    if exc.code in {
+        "roots_not_configured",
+        "invalid_path",
+        "repository_unavailable",
+        "worktree_unsupported",
+    }:
+        return HTTPException(
+            status_code=400,
+            detail="Repository is unavailable or not permitted.",
+        )
+    if exc.code == "unsafe_git_configuration":
+        return HTTPException(
+            status_code=400,
+            detail="Repository configuration is not supported for inspection.",
+        )
+    if exc.code == "invalid_request":
+        return HTTPException(status_code=422, detail="Invalid Git inspection request.")
+    if exc.code == "git_timeout":
+        return HTTPException(status_code=504, detail="Git inspection timed out.")
+    if exc.code == "output_limit_exceeded":
+        return HTTPException(status_code=413, detail="Git output exceeds the permitted limit.")
+    if exc.code == "git_unavailable":
+        return HTTPException(status_code=503, detail="Git inspection is unavailable.")
+    if exc.code == "git_access_denied":
+        return HTTPException(status_code=403, detail="Git inspection is not permitted.")
+    return HTTPException(status_code=500, detail="Git inspection failed.")
 
 
 class GenerateCodePayload(BaseModel):
@@ -893,6 +975,101 @@ def run_workflow(
 # ---------------------------------------------------------------------------
 # Repository RAG endpoints
 # ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/git-workspace/status",
+    response_model=GitWorkspaceStatusResponse,
+    tags=["git-workspace"],
+)
+def get_git_workspace_status(
+    payload: GitWorkspacePathPayload,
+    use_cases: GitWorkspaceUseCases = Depends(get_git_workspace_use_cases),
+) -> GitWorkspaceStatusResponse:
+    try:
+        result = use_cases.get_status(payload.repository_path)
+        return GitWorkspaceStatusResponse(
+            branch=result.branch,
+            is_clean=result.is_clean,
+            entries=[
+                GitWorkspaceStatusEntryModel(
+                    path=entry.path,
+                    index_status=entry.index_status,
+                    worktree_status=entry.worktree_status,
+                    kind=entry.kind,
+                    original_path=entry.original_path,
+                )
+                for entry in result.entries
+            ],
+        )
+    except GitServiceError as exc:
+        raise _git_workspace_http_error(exc) from None
+
+
+@router.post(
+    "/git-workspace/branch",
+    response_model=GitWorkspaceBranchResponse,
+    tags=["git-workspace"],
+)
+def get_git_workspace_branch(
+    payload: GitWorkspacePathPayload,
+    use_cases: GitWorkspaceUseCases = Depends(get_git_workspace_use_cases),
+) -> GitWorkspaceBranchResponse:
+    try:
+        return GitWorkspaceBranchResponse(
+            branch=use_cases.get_current_branch(payload.repository_path)
+        )
+    except GitServiceError as exc:
+        raise _git_workspace_http_error(exc) from None
+
+
+@router.post(
+    "/git-workspace/diff",
+    response_model=GitWorkspaceDiffResponse,
+    tags=["git-workspace"],
+)
+def get_git_workspace_diff(
+    payload: GitWorkspaceDiffPayload,
+    use_cases: GitWorkspaceUseCases = Depends(get_git_workspace_use_cases),
+) -> GitWorkspaceDiffResponse:
+    try:
+        return GitWorkspaceDiffResponse(
+            diff=use_cases.get_diff(
+                payload.repository_path,
+                staged=payload.staged,
+                max_bytes=payload.max_bytes,
+            )
+        )
+    except GitServiceError as exc:
+        raise _git_workspace_http_error(exc) from None
+
+
+@router.post(
+    "/git-workspace/history",
+    response_model=GitWorkspaceHistoryResponse,
+    tags=["git-workspace"],
+)
+def get_git_workspace_history(
+    payload: GitWorkspaceHistoryPayload,
+    use_cases: GitWorkspaceUseCases = Depends(get_git_workspace_use_cases),
+) -> GitWorkspaceHistoryResponse:
+    try:
+        commits = use_cases.get_commit_history(
+            payload.repository_path, payload.max_count
+        )
+        return GitWorkspaceHistoryResponse(
+            commits=[
+                GitWorkspaceCommitModel(
+                    hash=commit.hash,
+                    author=commit.author,
+                    date=commit.date,
+                    message=commit.message,
+                )
+                for commit in commits
+            ]
+        )
+    except GitServiceError as exc:
+        raise _git_workspace_http_error(exc) from None
 
 
 class IndexRepositoryPayload(BaseModel):

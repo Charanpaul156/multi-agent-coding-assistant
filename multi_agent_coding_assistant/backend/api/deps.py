@@ -42,6 +42,8 @@ from backend.application.job_manager import JobManager
 from backend.application.job_runner import JobRunner
 from backend.infrastructure.event_bus import EventBus
 from backend.application.modify_repository_use_cases import ModifyRepositoryUseCase
+from backend.application.git_workspace_use_cases import GitWorkspaceUseCases
+from backend.infrastructure.git_service import GitService
 from backend.infrastructure.approval_store import ApprovalStore
 from backend.infrastructure.change_applier import ChangeApplier
 from backend.infrastructure.change_validation import ChangeValidator
@@ -225,6 +227,18 @@ def _build_rag_config() -> RagConfig:
         top_k=settings.rag_top_k,
         allowed_repository_roots=tuple(settings.allowed_repository_roots),
     )
+
+
+@lru_cache(maxsize=1)
+def get_git_service() -> GitService:
+    """Provide the shared-root-policy Git inspection service."""
+    return GitService(config=_build_rag_config())
+
+
+@lru_cache(maxsize=1)
+def get_git_workspace_use_cases() -> GitWorkspaceUseCases:
+    """Provide the read-only Git workspace application boundary."""
+    return GitWorkspaceUseCases(git_service=get_git_service())
 
 
 @lru_cache(maxsize=1)
